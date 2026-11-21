@@ -1,0 +1,22 @@
+ID,PDF section,Requirement,Priority,Implementation,Verification,Status
+R01,3 and 6,Login and role-based access,P0,app_user and authorization middleware,Role access integration tests,Schema only
+R02,4.1,Mobile order entry and status,P0,Responsive order workflow and sales_order tables,Mobile E2E test,Schema only
+R03,4.2,Admin order verification and stock check,P0,Approval service with stock balance lock,Insufficient-stock integration test,Schema only
+R04,4.2,GST invoice PDF and intrastate/interstate tax,P0,Invoice service with GST components and PDF,Exact tax and PDF content tests,Schema only
+R05,4.2,Dispatch stock reduction,P0,Atomic dispatch and stock movements,Stock invariant integration tests,Prototype math tested
+R06,4.3,BOM and production runs,P0,BOM and production tables with posting service,End-to-end benchmark,Prototype math tested
+R07,4.3,Actual consumption and yield variance,P0,Production consumption and tolerance logic,5% oil and -6% yield assertions,Prototype math tested
+R08,4.3,Unit conversion,P0,Item-specific conversion table and conversion service,kg/g and carton/packet tests,Schema only
+R09,4.4,Separate stock types and traceable ledger,P0,Item kind and stock_movement with source,Ledger reconciliation tests,Schema only
+R10,4.6,Sales and stock CSV/Excel exports,P0,Report queries and export handlers,Export totals and headers test,Not started
+R11,7,Seed script and reproducible benchmark,P0,Deterministic seed and reset command,Run benchmark twice identically,Prototype only
+R12,7,Audit trail and cancellation controls,P0,Audit events and reversal/credit note service,Mutation authorization tests,Schema only
+R13,7,Single-command deployment,P0,Docker Compose with PostgreSQL and app,Fresh environment smoke test,Not started
+R14,4.2,Payments and outstanding ageing,P1,Payment and ageing service,4000 payment and 3875 balance test,Prototype math tested
+R15,4.2 and 4.6,Purchases and purchase register,P1,Purchase tables and report,60kg purchase ledger test,Prototype math tested
+R16,4.5,Weighted-average costing and overheads,P1,Valuation and run overhead service,Exact decimal cost test,Prototype math tested
+R17,4.6,GST and production audit reports,P1,Report queries and export,Reconcile against transactions,Not started
+R18,3 and 6,Owner dashboard,P1,Read-only summary queries,Role and totals tests,Not started
+R19,4.1,Offline order sync,P2,PWA IndexedDB queue with idempotency,Reconnect and duplicate test,Not started
+R20,4.4,Batch and expiry tracking,P2,Lot-specific movements and FEFO,Expiry dispatch tests,Not started
+R21,8,README design note demo and public repository,P0,Documentation and submission artifacts,Manual deliverable review,Not started
