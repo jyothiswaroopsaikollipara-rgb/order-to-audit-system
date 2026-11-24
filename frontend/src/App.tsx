@@ -23,11 +23,77 @@ type Order = {
   updated_at: string | null;
 };
 type Invoice = { id: number; invoice_no: string; order_id: number; customer_name: string; taxable: string; cgst: string; sgst: string; igst: string; total: string; paid: string; outstanding: string };
-type Masters = { items: { id: number; sku: string; kind: string }[]; customers: { id: number; name: string }[]; boms: { id: number; finished_item_id: number; expected_output: string }[] };
-type BomLine = { item_id: number; planned_qty: string; sku: string };
+
+type MasterItem = {
+  id: number;
+  sku: string;
+  name: string;
+  kind: string;
+  unit: string;
+  units_per_carton: string | null;
+};
+
+type Masters = {
+  items: MasterItem[];
+  customers: {
+    id: number;
+    name: string;
+  }[];
+  boms: {
+    id: number;
+    finished_item_id: number;
+    expected_output: string;
+  }[];
+};
+type BomLine = {
+  item_id: number;
+  planned_qty: string;
+  sku: string;
+  unit: string;
+  units_per_carton: string | null;
+};
 type BomDetail = { id: number; expected_output: string; finished_product: string; lines: BomLine[] };
-type ProductionRow = { id: number; bom_id: number; good_output: string; expected_output: string; material_cost: string; overhead: string; cost_per_packet: string; item_id: number; qty: string; planned_qty: string; damaged_qty: string; variance_pct: string; material_sku?: string; };
-type StockRow = { item_id: number; sku: string; balance: string };
+
+type ProductionRow = {
+  id: number;
+  bom_id: number;
+  good_output: string;
+  expected_output: string;
+  material_cost: string;
+  overhead: string;
+  cost_per_packet: string;
+  item_id: number;
+  qty: string;
+  planned_qty: string;
+  damaged_qty: string;
+  variance_pct: string | null;
+  material_sku?: string;
+  material_unit: string;
+  finished_product: string;
+  reference_selling_price: string | null;
+  effective_tolerance: string;
+  yield_variance_pct: string | null;
+  yield_alert: boolean;
+  material_alert: boolean;
+  profit_per_packet: string | null;
+  margin_pct: string | null;
+  total_cost: string;
+  historical_price: boolean;
+  historical_tolerance: boolean;
+  labour_cost: string | null;
+  energy_cost: string | null;
+};
+
+type ProductionSettings = {
+  variance_tolerance_pct: string;
+};
+type StockRow = {
+  item_id: string | number;
+  sku: string;
+  name: string;
+  unit: string;
+  quantity: string;
+};
 type InvoiceV2 = Invoice & { order_status: string; dispatched: boolean };
 const allRoles: Role[] = ['ADMIN', 'SALESMAN', 'PRODUCTION', 'AUDITOR', 'OWNER'];
 const nav = [
@@ -1013,60 +1079,1147 @@ async function shareInvoice(inv: InvoiceV2) {
 }
 
 
-function PurchaseEntry({ session, onUnauthorized }: { session: Session; onUnauthorized: () => void }) {
-  const { data: masters, loading, error: loadError } = useRemote<Masters>('/masters', session, onUnauthorized);
-  const [itemId, setItemId] = useState(''); const [quantity, setQuantity] = useState(''); const [unitCost, setUnitCost] = useState('');
-  const [reference, setReference] = useState(() => `UI-PUR-${crypto.randomUUID()}`);
-  const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [success, setSuccess] = useState('');
+
+function PurchaseEntry({
+  session,
+  onUnauthorized
+}: {
+  session: Session;
+  onUnauthorized: () => void;
+}) {
+  const {
+    data: masters,
+    loading,
+    error: loadError,
+    refresh
+  } = useRemote<Masters>(
+    '/masters',
+    session,
+    onUnauthorized
+  );
+
+  const [itemId, setItemId] = useState('');
+  const [quantity, setQuantity] = useState('');
+  const [unitCost, setUnitCost] = useState('');
+  const [unit, setUnit] = useState('');
+
+  const [reference, setReference] = useState(
+    () => `UI-PUR-${crypto.randomUUID()}`
+  );
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  const selected = masters?.items.find(
+    item => String(item.id) === itemId
+  );
+
+  const baseQuantity = selected
+    ? quantityInBase(
+        quantity,
+        unit || selected.unit,
+        selected.unit,
+        selected.units_per_carton
+      )
+    : 0;
+
+  const totalValue =
+    Number(quantity) * Number(unitCost);
+
+  const baseUnitCost = baseQuantity > 0
+    ? totalValue / baseQuantity
+    : 0;
+
+  const validPreview =
+    isPositive(quantity) &&
+    isPositive(unitCost) &&
+    Number.isFinite(baseQuantity) &&
+    Number.isFinite(baseUnitCost) &&
+    Number.isFinite(totalValue) &&
+    baseQuantity > 0;
+
+  function selectItem(value: string) {
+    setItemId(value);
+
+    const item = masters?.items.find(
+      x => String(x.id) === value
+    );
+
+    setUnit(item?.unit ?? '');
+    setQuantity('');
+    setUnitCost('');
+    setError('');
+    setSuccess('');
+  }
+
   async function submit(e: FormEvent) {
-    e.preventDefault(); if (!itemId || !isPositive(quantity) || !isPositive(unitCost) || !reference.trim()) { setError('Enter a material, positive quantity and unit cost, and a reference.'); return; }
-    if (!window.confirm(`Post purchase of ${quantity} units? This increases stock and creates an audit event.`)) return;
-    setBusy(true); setError(''); setSuccess('');
-    try { const result = await api<{id:number;replayed:boolean}>('/purchases',session.token,'POST',{reference:reference.trim(),itemId:Number(itemId),quantity,unitCost}); setSuccess(`Purchase #${result.id} ${result.replayed?'already existed (no duplicate posted)':'posted successfully'}.`); if (!result.replayed) {setQuantity('');setUnitCost('');setReference(`UI-PUR-${crypto.randomUUID()}`);} }
-    catch(e){const msg=messageOf(e);setError(msg);if(msg.includes('Session expired'))onUnauthorized();}finally{setBusy(false);}
+    e.preventDefault();
+
+    setError('');
+    setSuccess('');
+
+    if (
+      !selected ||
+      !validPreview ||
+      !reference.trim()
+    ) {
+      setError(
+        'Enter a material, valid quantity, unit cost and reference.'
+      );
+      return;
+    }
+
+    if (
+      ['piece', 'packet', 'carton'].includes(selected.unit) &&
+      !Number.isInteger(baseQuantity)
+    ) {
+      setError('Item requires whole inventory units.');
+      return;
+    }
+
+    if (!window.confirm(
+      `Confirm purchase\n\n` +
+      `Material: ${selected.sku}\n` +
+      `Entered: ${quantity} ${unit}\n` +
+      `Inventory receipt: ${baseQuantity} ${selected.unit}\n` +
+      `Total value: ₹${totalValue.toFixed(2)}\n\n` +
+      `This creates permanent inventory movements.`
+    )) return;
+
+    setBusy(true);
+
+    try {
+      const result = await api<{
+        id: number;
+        replayed: boolean;
+        baseQuantity?: string;
+        baseUnit?: string;
+        purchaseValue?: string;
+      }>(
+        '/purchases',
+        session.token,
+        'POST',
+        {
+          reference: reference.trim(),
+          itemId: Number(itemId),
+          quantity,
+          unitCost,
+          unit
+        }
+      );
+
+      setSuccess(
+        result.replayed
+          ? `Purchase #${result.id} already exists. No duplicate posted.`
+          : `Purchase #${result.id} posted successfully. Received ${result.baseQuantity} ${result.baseUnit}.`
+      );
+
+      setQuantity('');
+      setUnitCost('');
+      setReference(
+        `UI-PUR-${crypto.randomUUID()}`
+      );
+
+    } catch (e) {
+      const msg = messageOf(e);
+      setError(msg);
+
+      if (msg.includes('Session expired')) {
+        onUnauthorized();
+      }
+    } finally {
+      setBusy(false);
+    }
   }
-  return <Panel title="Purchase raw materials"><p className="muted">Post a stock receipt. Reference is retained after a failed request so retries are safe.</p><Alert error={loadError || error} success={success}/>{loading?<p className="muted">Loading materials…</p>:<form className="business-form" onSubmit={submit}><label htmlFor="purchase-item">Material</label><select id="purchase-item" required value={itemId} onChange={e=>setItemId(e.target.value)}><option value="">Choose material</option>{masters?.items.filter(x=>x.kind!=='FINISHED').map(x=><option key={x.id} value={x.id}>{x.sku} ({x.kind})</option>)}</select><label htmlFor="purchase-qty">Quantity</label><input id="purchase-qty" type="number" step="any" min="0.0001" required value={quantity} onChange={e=>setQuantity(e.target.value)}/><label htmlFor="purchase-cost">Unit cost (₹)</label><input id="purchase-cost" type="number" step="any" min="0.0001" required value={unitCost} onChange={e=>setUnitCost(e.target.value)}/><label htmlFor="purchase-ref">Unique purchase reference</label><input id="purchase-ref" required value={reference} onChange={e=>setReference(e.target.value)}/><button className="primary" disabled={busy}>{busy?'Posting…':'Post purchase'}</button></form>}</Panel>;
+
+  return (
+    <>
+      <Panel title="Purchase raw materials">
+        <p className="muted">
+          Record purchases in supported units.
+          Inventory and costing are normalized
+          automatically to the item's base unit.
+        </p>
+
+        <Alert
+          error={loadError || error}
+          success={success}
+        />
+
+        {loading ? (
+          <p className="muted">
+            Loading materials...
+          </p>
+        ) : (
+          <form
+            className="business-form production-form"
+            onSubmit={submit}
+          >
+            <fieldset disabled={busy}>
+              <label htmlFor="purchase-item">
+                Material
+              </label>
+
+              <select
+                id="purchase-item"
+                required
+                value={itemId}
+                onChange={e =>
+                  selectItem(e.target.value)
+                }
+              >
+                <option value="">
+                  Choose material
+                </option>
+
+                {masters?.items
+                  .filter(x => x.kind !== 'FINISHED')
+                  .map(x => (
+                    <option key={x.id} value={x.id}>
+                      {x.sku} ({x.kind})
+                    </option>
+                  ))}
+              </select>
+
+              {selected && (
+                <>
+                  <label htmlFor="purchase-unit">
+                    Purchase unit
+                  </label>
+
+                  <select
+                    id="purchase-unit"
+                    value={unit}
+                    onChange={e => {
+                      setUnit(e.target.value);
+                      setQuantity('');
+                      setUnitCost('');
+                    }}
+                  >
+                    {availableUnits(
+                      selected.unit,
+                      selected.units_per_carton
+                    ).map(u => (
+                      <option key={u} value={u}>
+                        {u}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+
+              <label htmlFor="purchase-qty">
+                Quantity {unit && `(${unit})`}
+              </label>
+
+              <input
+                id="purchase-qty"
+                type="number"
+                step="any"
+                min="0"
+                required
+                value={quantity}
+                onChange={e =>
+                  setQuantity(e.target.value)
+                }
+              />
+
+              <label htmlFor="purchase-cost">
+                Unit cost (₹{unit && `/${unit}`})
+              </label>
+
+              <input
+                id="purchase-cost"
+                type="number"
+                step="any"
+                min="0"
+                required
+                value={unitCost}
+                onChange={e =>
+                  setUnitCost(e.target.value)
+                }
+              />
+
+              {selected && validPreview && (
+                <div className="production-metrics">
+                  <div>
+                    <span>Inventory receipt</span>
+                    <strong>
+                      {Number(baseQuantity.toFixed(4))}
+                      {' '}{selected.unit}
+                    </strong>
+                  </div>
+
+                  <div>
+                    <span>Normalized unit cost</span>
+                    <strong>
+                      ₹{Number(baseUnitCost.toFixed(6))}
+                      /{selected.unit}
+                    </strong>
+                  </div>
+
+                  <div>
+                    <span>Total purchase value</span>
+                    <strong>
+                      ₹{totalValue.toFixed(2)}
+                    </strong>
+                  </div>
+                </div>
+              )}
+
+              <label htmlFor="purchase-ref">
+                Unique purchase reference
+              </label>
+
+              <input
+                id="purchase-ref"
+                required
+                value={reference}
+                onChange={e =>
+                  setReference(e.target.value)
+                }
+              />
+
+              <button
+                className="primary"
+                disabled={busy || !validPreview}
+              >
+                {busy
+                  ? 'Posting...'
+                  : 'Post purchase'}
+              </button>
+            </fieldset>
+          </form>
+        )}
+      </Panel>
+
+      {session.role === 'ADMIN' && (
+        <CartonSettings
+          session={session}
+          onUnauthorized={onUnauthorized}
+          items={masters?.items ?? []}
+          onUpdated={() => {
+            refresh();
+            setItemId('');
+            setUnit('');
+            setQuantity('');
+            setUnitCost('');
+          }}
+        />
+      )}
+    </>
+  );
 }
-function ProductionEntry({session,onUnauthorized}:{session:Session;onUnauthorized:()=>void}) {
-  const {error:masterError,loading:masterLoading}=useRemote<Masters>('/masters',session,onUnauthorized);
-  const {data:stock,error:stockError,refresh:refreshStock}=useRemote<StockRow[]>('/stock',session,onUnauthorized);
-  const {data:details,error:detailError,loading:detailLoading}=useRemote<BomDetail[]>('/production/boms',session,onUnauthorized);
-  const [bomId,setBomId]=useState('');const [goodOutput,setGoodOutput]=useState('');const [labour,setLabour]=useState('0');const [energy,setEnergy]=useState('0');
-  const [issues,setIssues]=useState<Record<number,{quantity:string;damagedQty:string}>>({});
-  const [requestKey,setRequestKey]=useState(()=>crypto.randomUUID());const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [success,setSuccess]=useState('');
-  const bom=details?.find(b=>String(b.id)===bomId);
-  function selectBom(id:string){setBomId(id);const selected=details?.find(b=>String(b.id)===id);setIssues(Object.fromEntries((selected?.lines??[]).map(l=>[l.item_id,{quantity:String(l.planned_qty),damagedQty:'0'}])));setGoodOutput(selected?String(selected.expected_output):'');setRequestKey(crypto.randomUUID());setSuccess('');setError('');}
-  function editIssue(id:number,key:'quantity'|'damagedQty',value:string){setIssues(prev=>({...prev,[id]:{...prev[id],quantity:prev[id]?.quantity??'',damagedQty:prev[id]?.damagedQty??'0',[key]:value}}));}
-  async function submit(e:FormEvent){e.preventDefault();setError('');setSuccess('');
-    if(!bom||!isPositive(goodOutput)||Number(labour)<0||Number(energy)<0||!Number.isFinite(Number(labour))||!Number.isFinite(Number(energy))){setError('Select a BOM and enter valid output and nonnegative overhead.');return;}
-    for(const l of bom.lines){const x=issues[l.item_id];if(!x||!isPositive(x.quantity)||Number(x.damagedQty)<0||Number(x.damagedQty)>Number(x.quantity)||!Number.isFinite(Number(x.damagedQty))){setError(`Invalid issue or damaged quantity for ${l.sku}.`);return;}const balance=stock?.find(s=>Number(s.item_id)===l.item_id);if(balance&&Number(x.quantity)>Number(balance.balance)){setError(`Insufficient stock for ${l.sku}; available ${balance.balance}.`);return;}}
-    const materialSummary = bom.lines.map(l => {
-  const issue = issues[l.item_id];
 
-  return `${l.sku}: Issued ${issue.quantity}, Damaged ${issue.damagedQty}`;
-}).join('\n');
 
-const confirmation = [
-  'Confirm production run',
-  '',
-  `Expected output: ${bom.expected_output}`,
-  `Good output: ${goodOutput}`,
-  '',
-  'Material consumption:',
-  materialSummary,
-  '',
-  `Labour: ₹${labour}`,
-  `Energy: ₹${energy}`,
-  '',
-  'This will post permanent inventory movements.'
-].join('\n');
+function CartonSettings({
+  session,
+  onUnauthorized,
+  items,
+  onUpdated
+}: {
+  session: Session;
+  onUnauthorized: () => void;
+  items: MasterItem[];
+  onUpdated: () => void;
+}) {
+  const [itemId, setItemId] = useState('');
+  const [ratio, setRatio] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
 
-if (!window.confirm(confirmation)) return;
-    setBusy(true);try{const result=await api<{run:{id:number;cost_per_packet:string};yieldVariancePct:string;replayed:boolean}>('/production-runs',session.token,'POST',{requestKey,bomId:Number(bomId),goodOutput,issues:bom.lines.map(l=>({itemId:l.item_id,quantity:issues[l.item_id].quantity,damagedQty:issues[l.item_id].damagedQty})),labour,energy});setSuccess(`Run #${result.run.id} ${result.replayed?'already existed':'posted'} · yield variance ${result.yieldVariancePct}% · cost/packet ₹${result.run.cost_per_packet}.`);if(!result.replayed){setRequestKey(crypto.randomUUID());refreshStock();}}
-    catch(e){const msg=messageOf(e);setError(msg);if(msg.includes('Session expired'))onUnauthorized();}finally{setBusy(false);}
+  const eligible = items.filter(
+    item => ['piece', 'packet'].includes(item.unit)
+  );
+
+  const selected = eligible.find(
+    item => String(item.id) === itemId
+  );
+
+  function selectItem(value: string) {
+    setItemId(value);
+
+    const item = eligible.find(
+      x => String(x.id) === value
+    );
+
+    setRatio(item?.units_per_carton ?? '');
+    setError('');
+    setSuccess('');
   }
-  return <Panel title="Record production run"><p className="muted">All BOM materials are mandatory. Quantities are actual material issues; damaged quantity is a subset of the issue, not an additional stock deduction.</p><Alert error={masterError||stockError||detailError||error} success={success}/>{masterLoading||detailLoading?<p className="muted">Loading BOM details…</p>:<form className="business-form production-form" onSubmit={submit}><label htmlFor="bom">Bill of materials</label><select id="bom" required value={bomId} onChange={e=>selectBom(e.target.value)}><option value="">Choose BOM</option>{details?.map(b=><option key={b.id} value={b.id}>#{b.id} · {b.finished_product} · expected {b.expected_output}</option>)}</select>{bom&&<><div className="variance-preview">Expected output: <strong>{bom.expected_output}</strong>{isPositive(goodOutput)&&<span> · Preview yield variance: <strong>{((Number(goodOutput)/Number(bom.expected_output)-1)*100).toFixed(2)}%</strong></span>}</div><div className="table-wrap"><table><thead><tr><th>Material</th><th>Planned</th><th>Available</th><th>Actual issued</th><th>Damaged</th><th>Variance</th></tr></thead><tbody>{bom.lines.map(l=>{const x=issues[l.item_id];const balance=stock?.find(s=>Number(s.item_id)===l.item_id);return <tr key={l.item_id}><td>{l.sku}</td><td>{l.planned_qty}</td><td>{balance?.balance??'—'}</td><td><input aria-label={`${l.sku} actual issued`} type="number" step="any" min="0.0001" required value={x?.quantity??''} onChange={e=>editIssue(l.item_id,'quantity',e.target.value)}/></td><td><input aria-label={`${l.sku} damaged`} type="number" step="any" min="0" required value={x?.damagedQty??'0'} onChange={e=>editIssue(l.item_id,'damagedQty',e.target.value)}/></td><td>{x&&isPositive(x.quantity)&&Number(l.planned_qty)>0?`${((Number(x.quantity)/Number(l.planned_qty)-1)*100).toFixed(2)}%`:'—'}</td></tr>;})}</tbody></table></div><label htmlFor="good-output">Good output (packets)</label><input id="good-output" type="number" step="any" min="0.0001" required value={goodOutput} onChange={e=>setGoodOutput(e.target.value)}/><label htmlFor="labour">Labour cost (₹)</label><input id="labour" type="number" step="any" min="0" required value={labour} onChange={e=>setLabour(e.target.value)}/><label htmlFor="energy">Energy cost (₹)</label><input id="energy" type="number" step="any" min="0" required value={energy} onChange={e=>setEnergy(e.target.value)}/><p className="muted">Request key: {requestKey}</p><button className="primary" disabled={busy}>{busy?'Posting…':'Post production run'}</button></>}</form>}</Panel>;
+
+  async function save(value: number | null) {
+    setError('');
+    setSuccess('');
+
+    if (!selected) {
+      setError('Choose an item.');
+      return;
+    }
+
+    if (
+      value !== null &&
+      (
+        !Number.isInteger(value) ||
+        value <= 0 ||
+        value > 1000000
+      )
+    ) {
+      setError(
+        'Enter a positive whole-number carton ratio.'
+      );
+      return;
+    }
+
+    if (!window.confirm(
+      value === null
+        ? `Disable carton conversion for ${selected.sku}?`
+        : `Set 1 carton = ${value} ${selected.unit}(s) for ${selected.sku}?`
+    )) return;
+
+    setBusy(true);
+
+    try {
+      await api<unknown>(
+        `/masters/items/${selected.id}/carton-ratio`,
+        session.token,
+        'POST',
+        { unitsPerCarton: value }
+      );
+
+      setSuccess(
+        value === null
+          ? 'Carton conversion disabled.'
+          : `Carton ratio saved for ${selected.sku}.`
+      );
+
+      setRatio(
+        value === null ? '' : String(value)
+      );
+
+      onUpdated();
+
+    } catch (e) {
+      const msg = messageOf(e);
+      setError(msg);
+
+      if (msg.includes('Session expired')) {
+        onUnauthorized();
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel title="Carton conversion settings">
+      <p className="muted">
+        Configure how many pieces or packets
+        are contained in one carton for each item.
+        Existing inventory records are not changed.
+      </p>
+
+      <Alert error={error} success={success}/>
+
+      <form
+        className="business-form production-form"
+        onSubmit={e => {
+          e.preventDefault();
+          void save(Number(ratio));
+        }}
+      >
+        <fieldset disabled={busy}>
+          <label htmlFor="carton-item">
+            Item
+          </label>
+
+          <select
+            id="carton-item"
+            required
+            value={itemId}
+            onChange={e =>
+              selectItem(e.target.value)
+            }
+          >
+            <option value="">
+              Choose item
+            </option>
+
+            {eligible.map(item => (
+              <option key={item.id} value={item.id}>
+                {item.sku}
+              </option>
+            ))}
+          </select>
+
+          {selected && (
+            <>
+              <p className="muted">
+                Current ratio:
+                {' '}
+                {selected.units_per_carton == null
+                  ? 'Not configured'
+                  : `1 carton = ${selected.units_per_carton} ${selected.unit}(s)`}
+              </p>
+
+              <label htmlFor="carton-ratio">
+                Base units per carton
+              </label>
+
+              <input
+                id="carton-ratio"
+                type="number"
+                min="1"
+                max="1000000"
+                step="1"
+                required
+                value={ratio}
+                onChange={e =>
+                  setRatio(e.target.value)
+                }
+              />
+
+              <div className="inline-actions">
+                <button
+                  className="primary"
+                  disabled={busy}
+                >
+                  Save carton ratio
+                </button>
+
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => void save(null)}
+                >
+                  Disable conversion
+                </button>
+              </div>
+            </>
+          )}
+        </fieldset>
+      </form>
+    </Panel>
+  );
 }
+
+
+
+function availableUnits(
+  base: string,
+  ratio: string | null = null
+): string[] {
+  if (base === 'kg') return ['kg', 'g'];
+  if (base === 'g') return ['g', 'kg'];
+
+  if (base === 'litre') return ['litre', 'ml'];
+  if (base === 'ml') return ['ml', 'litre'];
+
+  if (
+    ['piece', 'packet'].includes(base) &&
+    Number(ratio) > 0
+  ) {
+    return [base, 'carton'];
+  }
+
+  return [base];
+}
+
+function quantityInBase(
+  quantity: string,
+  from: string,
+  base: string,
+  ratio: string | null = null
+): number {
+  const n = Number(quantity);
+
+  if (!Number.isFinite(n) || n < 0) {
+    return NaN;
+  }
+
+  if (from === base) return n;
+
+  if (from === 'g' && base === 'kg') {
+    return n / 1000;
+  }
+
+  if (from === 'kg' && base === 'g') {
+    return n * 1000;
+  }
+
+  if (from === 'ml' && base === 'litre') {
+    return n / 1000;
+  }
+
+  if (from === 'litre' && base === 'ml') {
+    return n * 1000;
+  }
+
+  if (
+    from === 'carton' &&
+    ['piece', 'packet'].includes(base) &&
+    Number(ratio) > 0
+  ) {
+    return n * Number(ratio);
+  }
+
+  return NaN;
+}
+
+function VarianceIndicator({
+  value,
+  tolerance
+}: {
+  value: number;
+  tolerance: number;
+}) {
+  if (!Number.isFinite(value)) {
+    return <span>—</span>;
+  }
+
+  const rounded = Number(value.toFixed(2));
+  const outside = Math.abs(rounded) > tolerance;
+
+  return (
+    <span
+      className={
+        outside
+          ? 'variance-alert'
+          : 'variance-normal'
+      }
+    >
+      {rounded > 0 ? '+' : ''}
+      {rounded.toFixed(2)}%
+      {outside ? ' · Alert' : ' · OK'}
+    </span>
+  );
+}
+
+
+
+function ProductionEntry({
+  session,
+  onUnauthorized
+}: {
+  session: Session;
+  onUnauthorized: () => void;
+}) {
+  const {
+    data: stock,
+    error: stockError,
+    refresh: refreshStock
+  } = useRemote<StockRow[]>(
+    '/stock', session, onUnauthorized
+  );
+
+  const {
+    data: details,
+    error: detailError,
+    loading: detailLoading
+  } = useRemote<BomDetail[]>(
+    '/production/boms', session, onUnauthorized
+  );
+
+  const {
+    data: settings,
+    error: settingsError
+  } = useRemote<ProductionSettings>(
+    '/production/settings', session, onUnauthorized
+  );
+
+  const tolerance = Number(
+    settings?.variance_tolerance_pct ?? 3
+  );
+
+  const [bomId, setBomId] = useState('');
+  const [goodOutput, setGoodOutput] = useState('');
+  const [labour, setLabour] = useState('0');
+  const [energy, setEnergy] = useState('0');
+
+  const [issues, setIssues] = useState<
+    Record<number, {
+      quantity: string;
+      damagedQty: string;
+      unit: string;
+    }>
+  >({});
+
+  const [requestKey, setRequestKey] =
+    useState(() => crypto.randomUUID());
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  const bom = details?.find(
+    b => String(b.id) === bomId
+  );
+
+  function selectBom(id: string) {
+    setBomId(id);
+
+    const selected = details?.find(
+      b => String(b.id) === id
+    );
+
+    setIssues(
+      Object.fromEntries(
+        (selected?.lines ?? []).map(l => [
+          l.item_id,
+          {
+            quantity: String(l.planned_qty),
+            damagedQty: '0',
+            unit: l.unit
+          }
+        ])
+      )
+    );
+
+    setGoodOutput(
+      selected
+        ? String(selected.expected_output)
+        : ''
+    );
+
+    setRequestKey(crypto.randomUUID());
+    setSuccess('');
+    setError('');
+  }
+
+  function editIssue(
+    id: number,
+    key: 'quantity' | 'damagedQty' | 'unit',
+    value: string
+  ) {
+    setIssues(prev => ({
+      ...prev,
+      [id]: {
+        ...prev[id],
+        [key]: value
+      }
+    }));
+  }
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setError('');
+    setSuccess('');
+
+    if (
+      !bom ||
+      !isPositive(goodOutput) ||
+      !Number.isInteger(Number(goodOutput)) ||
+      labour.trim() === '' ||
+      energy.trim() === '' ||
+      !Number.isFinite(Number(labour)) ||
+      !Number.isFinite(Number(energy)) ||
+      Number(labour) < 0 ||
+      Number(energy) < 0
+    ) {
+      setError(
+        'Enter a valid whole-number output and nonnegative overhead.'
+      );
+      return;
+    }
+
+    for (const line of bom.lines) {
+      const issue = issues[line.item_id];
+
+      if (!issue) {
+        setError(`Missing issue for ${line.sku}`);
+        return;
+      }
+
+      const issued = quantityInBase(
+        issue.quantity,
+        issue.unit,
+        line.unit,
+        line.units_per_carton
+      );
+
+      const balance = stock?.find(
+        s => String(s.item_id) === String(line.item_id)
+      );
+
+      if (
+        balance &&
+        issued > Number(balance.quantity)
+      ) {
+        setError(
+          `Insufficient stock for ${line.sku}. Available: ${balance.quantity} ${line.unit}`
+        );
+        return;
+      }
+    }
+
+    const summary = bom.lines.map(line => {
+      const issue = issues[line.item_id];
+
+      return `${line.sku}: ${issue.quantity} ${issue.unit}, damaged ${issue.damagedQty} ${issue.unit}`;
+    }).join('\n');
+
+    if (!window.confirm(
+      `Confirm production run\n\n${summary}\n\nGood output: ${goodOutput} packets\nLabour: ₹${labour}\nEnergy: ₹${energy}\n\nThis posts permanent inventory movements.`
+    )) return;
+
+    setBusy(true);
+
+    try {
+      const result = await api<{
+        run: {
+          id: number;
+          cost_per_packet: string;
+        };
+        yieldVariancePct: string;
+        alerts?: unknown[];
+        margin?: {
+          profitPerPacket: string;
+          marginPct: string;
+        } | null;
+        replayed: boolean;
+      }>(
+        '/production-runs',
+        session.token,
+        'POST',
+        {
+          requestKey,
+          bomId: Number(bomId),
+          goodOutput,
+          issues: bom.lines.map(line => ({
+            itemId: Number(line.item_id),
+            ...issues[line.item_id]
+          })),
+          labour,
+          energy
+        }
+      );
+
+      const marginText = result.margin
+        ? ` · Margin ${result.margin.marginPct}%`
+        : '';
+
+      const alertText = result.alerts
+        ? ` · ${result.alerts.length} variance alerts`
+        : '';
+
+      setSuccess(
+        `Run #${result.run.id} ${
+          result.replayed
+            ? 'already existed'
+            : 'posted'
+        } · Yield variance ${result.yieldVariancePct}% · Cost/packet ₹${result.run.cost_per_packet}${marginText}${alertText}`
+      );
+
+      setBomId('');
+      setGoodOutput('');
+      setIssues({});
+      setLabour('0');
+      setEnergy('0');
+      setRequestKey(crypto.randomUUID());
+
+      refreshStock();
+
+    } catch (e) {
+      const msg = messageOf(e);
+      setError(msg);
+
+      if (msg.includes('Session expired')) {
+        onUnauthorized();
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel title="Record production run">
+      <p className="muted">
+        Enter actual material consumption.
+        Damaged quantity is included in the issued
+        quantity, not deducted a second time.
+      </p>
+
+      <Alert
+        error={
+          stockError ||
+          detailError ||
+          settingsError ||
+          error
+        }
+        success={success}
+      />
+
+      <div className="variance-preview">
+        Variance tolerance:
+        <strong> ±{tolerance}%</strong>
+      </div>
+
+      {detailLoading ? (
+        <p className="muted">
+          Loading BOM details...
+        </p>
+      ) : (
+        <form
+          className="business-form production-form"
+          onSubmit={submit}
+        >
+          <fieldset disabled={busy}>
+            <label htmlFor="bom">
+              Bill of materials
+            </label>
+
+            <select
+              id="bom"
+              value={bomId}
+              onChange={e => selectBom(e.target.value)}
+              required
+            >
+              <option value="">Choose BOM</option>
+
+              {details?.map(b => (
+                <option key={b.id} value={b.id}>
+                  #{b.id} · {b.finished_product}
+                  {' · Expected '}
+                  {b.expected_output}
+                </option>
+              ))}
+            </select>
+
+            {bom && (
+              <>
+                <div className="variance-preview">
+                  Expected output:
+                  <strong> {bom.expected_output}</strong>
+
+                  {' · Yield variance: '}
+
+                  <VarianceIndicator
+                    value={
+                      isPositive(goodOutput)
+                        ? (
+                            Number(goodOutput) /
+                            Number(bom.expected_output) - 1
+                          ) * 100
+                        : NaN
+                    }
+                    tolerance={tolerance}
+                  />
+                </div>
+
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Material</th>
+                        <th>Planned</th>
+                        <th>Available</th>
+                        <th>Input unit</th>
+                        <th>Actual issued</th>
+                        <th>Damaged</th>
+                        <th>Base quantity</th>
+                        <th>Variance</th>
+                      </tr>
+                    </thead>
+
+                    <tbody>
+                      {bom.lines.map(line => {
+                        const issue = issues[line.item_id];
+
+                        const balance = stock?.find(
+                          s =>
+                            String(s.item_id) ===
+                            String(line.item_id)
+                        );
+
+                        const converted = quantityInBase(
+                          issue?.quantity ?? '',
+                          issue?.unit ?? line.unit,
+                          line.unit,
+                          line.units_per_carton
+                        );
+
+                        const variancePct =
+                          Number(line.planned_qty) > 0 &&
+                          isPositive(issue?.quantity ?? '')
+                            ? (
+                                converted /
+                                Number(line.planned_qty) - 1
+                              ) * 100
+                            : NaN;
+
+                        return (
+                          <tr key={line.item_id}>
+                            <td>{line.sku}</td>
+
+                            <td>
+                              {line.planned_qty} {line.unit}
+                            </td>
+
+                            <td>
+                              {balance?.quantity ?? '—'}
+                              {' '}{line.unit}
+                            </td>
+
+                            <td>
+                              <select
+                                aria-label={`${line.sku} unit`}
+                                value={issue?.unit ?? line.unit}
+                                onChange={e =>
+                                  editIssue(
+                                    line.item_id,
+                                    'unit',
+                                    e.target.value
+                                  )
+                                }
+                              >
+                                {availableUnits(
+                                  line.unit,
+                                  line.units_per_carton
+                                ).map(unit => (
+                                  <option
+                                    key={unit}
+                                    value={unit}
+                                  >
+                                    {unit}
+                                  </option>
+                                ))}
+                              </select>
+                            </td>
+
+                            <td>
+                              <input
+                                aria-label={`${line.sku} issued`}
+                                type="number"
+                                min="0.0001"
+                                step="any"
+                                required
+                                value={issue?.quantity ?? ''}
+                                onChange={e =>
+                                  editIssue(
+                                    line.item_id,
+                                    'quantity',
+                                    e.target.value
+                                  )
+                                }
+                              />
+                            </td>
+
+                            <td>
+                              <input
+                                aria-label={`${line.sku} damaged`}
+                                type="number"
+                                min="0"
+                                step="any"
+                                required
+                                value={issue?.damagedQty ?? '0'}
+                                onChange={e =>
+                                  editIssue(
+                                    line.item_id,
+                                    'damagedQty',
+                                    e.target.value
+                                  )
+                                }
+                              />
+                            </td>
+
+                            <td>
+                              {Number.isFinite(converted)
+                                ? `${Number(converted.toFixed(4))} ${line.unit}`
+                                : '—'}
+                            </td>
+
+                            <td>
+                              <VarianceIndicator
+                                value={variancePct}
+                                tolerance={tolerance}
+                              />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <label htmlFor="good-output">
+                  Good output (packets)
+                </label>
+
+                <input
+                  id="good-output"
+                  type="number"
+                  min="1"
+                  step="1"
+                  required
+                  value={goodOutput}
+                  onChange={e =>
+                    setGoodOutput(e.target.value)
+                  }
+                />
+
+                <label htmlFor="labour">
+                  Labour cost (₹)
+                </label>
+
+                <input
+                  id="labour"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  required
+                  value={labour}
+                  onChange={e =>
+                    setLabour(e.target.value)
+                  }
+                />
+
+                <label htmlFor="energy">
+                  Energy cost (₹)
+                </label>
+
+                <input
+                  id="energy"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  required
+                  value={energy}
+                  onChange={e =>
+                    setEnergy(e.target.value)
+                  }
+                />
+
+                <div className="variance-preview">
+                  Total overhead:
+                  <strong>
+                    {' ₹'}
+                    {(
+                      Number(labour) + Number(energy)
+                    ).toFixed(2)}
+                  </strong>
+                </div>
+
+                <button
+                  className="primary"
+                  disabled={busy || !settings}
+                >
+                  {busy
+                    ? 'Posting...'
+                    : 'Post production run'}
+                </button>
+              </>
+            )}
+          </fieldset>
+        </form>
+      )}
+    </Panel>
+  );
+}
+
+
 function ProductionReport({
   session,
   onUnauthorized
@@ -1074,127 +2227,329 @@ function ProductionReport({
   session: Session;
   onUnauthorized: () => void;
 }) {
-  const { data, error, loading, refresh } =
-    useRemote<ProductionRow[]>(
-      '/reports/production',
-      session,
-      onUnauthorized
-    );
+  const {
+    data,
+    error,
+    loading,
+    refresh
+  } = useRemote<ProductionRow[]>(
+    '/reports/production',
+    session,
+    onUnauthorized
+  );
+
+  const {
+    data: settings,
+    error: settingsError,
+    refresh: refreshSettings
+  } = useRemote<ProductionSettings>(
+    '/production/settings',
+    session,
+    onUnauthorized
+  );
+
+  const [newTolerance, setNewTolerance] =
+    useState('');
+
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const [success, setSuccess] = useState('');
 
   const runs = [
-    ...new Map((data ?? []).map(x => [x.id, x])).values()
+    ...new Map(
+      (data ?? []).map(row => [row.id, row])
+    ).values()
   ];
+
+  async function saveTolerance(e: FormEvent) {
+    e.preventDefault();
+    setSaveError('');
+    setSuccess('');
+
+    const value = Number(newTolerance);
+
+    if (
+      newTolerance.trim() === '' ||
+      !Number.isFinite(value) ||
+      value < 0 ||
+      value > 100
+    ) {
+      setSaveError(
+        'Tolerance must be between 0 and 100%.'
+      );
+      return;
+    }
+
+    setSaving(true);
+
+    try {
+      await api<ProductionSettings>(
+        '/production/settings',
+        session.token,
+        'POST',
+        { tolerancePct: value }
+      );
+
+      setSuccess(
+        `Variance tolerance updated to ${value}%.`
+      );
+
+      setNewTolerance('');
+      refreshSettings();
+      refresh();
+
+    } catch (e) {
+      const msg = messageOf(e);
+      setSaveError(msg);
+
+      if (msg.includes('Session expired')) {
+        onUnauthorized();
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function displayMoney(value: string | null) {
+    return value == null
+      ? '—'
+      : `₹${Number(value).toFixed(2)}`;
+  }
 
   return (
     <Panel
-      title="Production and material variances"
-      onRefresh={refresh}
+      title="Production, variances and costing"
+      onRefresh={() => {
+        refresh();
+        refreshSettings();
+      }}
     >
-      <Alert error={error} />
+      <Alert
+        error={error || settingsError || saveError}
+        success={success}
+      />
+
+      <div className="variance-preview">
+        Current variance tolerance:
+        <strong>
+          {' ±'}
+          {settings?.variance_tolerance_pct ?? '—'}%
+        </strong>
+      </div>
+
+      {session.role === 'ADMIN' && (
+        <form
+          className="business-form tolerance-form"
+          onSubmit={saveTolerance}
+        >
+          <label htmlFor="variance-tolerance">
+            Configure variance tolerance (%)
+          </label>
+
+          <input
+            id="variance-tolerance"
+            type="number"
+            min="0"
+            max="100"
+            step="0.01"
+            required
+            placeholder={
+              settings?.variance_tolerance_pct ?? '3'
+            }
+            value={newTolerance}
+            onChange={e =>
+              setNewTolerance(e.target.value)
+            }
+          />
+
+          <button
+            className="secondary"
+            disabled={saving}
+          >
+            {saving ? 'Saving...' : 'Update tolerance'}
+          </button>
+        </form>
+      )}
 
       {loading ? (
-        <p className="muted">Loading production report…</p>
-      ) : !data?.length ? (
-        <p className="muted">No production runs yet.</p>
+        <p className="muted">
+          Loading production report...
+        </p>
+      ) : !runs.length ? (
+        <p className="muted">
+          No production runs yet.
+        </p>
       ) : (
-        <>
-          {runs.map(run => (
+        runs.map(run => {
+          const materials = (data ?? []).filter(
+            row => String(row.id) === String(run.id)
+          );
+
+          const alertCount =
+            materials.filter(
+              row => row.material_alert
+            ).length +
+            Number(run.yield_alert);
+
+          const tolerance =
+            Number(run.effective_tolerance);
+
+          return (
             <section
               key={run.id}
               className="production-report-run"
             >
-              <h3>Production Run #{run.id}</h3>
+              <div className="panel-heading">
+                <h3>
+                  Production Run #{run.id}
+                  {' · '}{run.finished_product}
+                </h3>
 
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Expected output</th>
-                      <th>Good output</th>
-                      <th>Yield variance</th>
-                      <th>Material cost</th>
-                      <th>Overhead</th>
-                      <th>Cost / packet</th>
-                    </tr>
-                  </thead>
-
-                  <tbody>
-                    <tr>
-                      <td>{run.expected_output}</td>
-                      <td>{run.good_output}</td>
-                      <td>
-                        {(
-                          (Number(run.good_output) /
-                            Number(run.expected_output) - 1) *
-                          100
-                        ).toFixed(2)}%
-                      </td>
-                      <td>₹{run.material_cost}</td>
-                      <td>₹{run.overhead}</td>
-                      <td>₹{run.cost_per_packet}</td>
-                    </tr>
-                  </tbody>
-                </table>
+                <span className={
+                  alertCount
+                    ? 'variance-alert'
+                    : 'variance-normal'
+                }>
+                  {alertCount
+                    ? `${alertCount} variance alerts`
+                    : 'Within tolerance'}
+                </span>
               </div>
 
-              <h4>Material Consumption Details</h4>
+              <div className="production-metrics">
+                <div>
+                  <span>Expected output</span>
+                  <strong>{run.expected_output}</strong>
+                </div>
+
+                <div>
+                  <span>Good output</span>
+                  <strong>{run.good_output}</strong>
+                </div>
+
+                <div>
+                  <span>Production yield</span>
+                  <strong>
+                    {(
+                      Number(run.good_output) /
+                      Number(run.expected_output) * 100
+                    ).toFixed(2)}%
+                  </strong>
+                </div>
+
+                <div>
+                  <span>Yield variance</span>
+                  <VarianceIndicator
+                    value={
+                      run.yield_variance_pct == null
+                        ? NaN
+                        : Number(run.yield_variance_pct)
+                    }
+                    tolerance={tolerance}
+                  />
+                </div>
+              </div>
+
+              <p className="muted">
+                Tolerance: ±{run.effective_tolerance}%
+                {' · '}
+                {run.historical_tolerance
+                  ? 'Saved at production'
+                  : 'Current reference tolerance'}
+              </p>
+
+              <h4>Material consumption</h4>
 
               <div className="table-wrap">
                 <table>
                   <thead>
                     <tr>
                       <th>Material</th>
+                      <th>Unit</th>
                       <th>Planned</th>
                       <th>Actual issued</th>
-                      <th>Damaged quantity</th>
-                      <th>Material variance</th>
+                      <th>Damaged</th>
+                      <th>Variance</th>
                     </tr>
                   </thead>
 
                   <tbody>
-                    {data
-                      .filter(row => row.id === run.id)
-                      .map(row => (
-                        <tr key={`${row.id}-${row.item_id}`}>
-                          <td>
-                            {row.material_sku ??
-                              `Item #${row.item_id}`}
-                          </td>
-                          <td>{Number(row.planned_qty)}</td>
-                          <td>{Number(row.qty)}</td>
-                          <td
-                            className={
-                              Number(row.damaged_qty) > 0
-                                ? 'variance-warning'
-                                : ''
+                    {materials.map(row => (
+                      <tr key={row.item_id}>
+                        <td>
+                          {row.material_sku ?? row.item_id}
+                        </td>
+
+                        <td>{row.material_unit}</td>
+                        <td>{row.planned_qty}</td>
+                        <td>{row.qty}</td>
+                        <td>{row.damaged_qty}</td>
+
+                        <td>
+                          <VarianceIndicator
+                            value={
+                              row.variance_pct == null
+                                ? NaN
+                                : Number(row.variance_pct)
                             }
-                          >
-                            {Number(row.damaged_qty)}
-                          </td>
-                          <td
-                            className={
-                              Number(row.variance_pct) > 0
-                                ? 'variance-warning'
-                                : ''
-                            }
-                          >
-                            {Number(row.variance_pct) > 0
-                              ? '+'
-                              : ''}
-                            {Number(row.variance_pct).toFixed(2)}%
-                          </td>
-                        </tr>
-                      ))}
+                            tolerance={tolerance}
+                          />
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
+
+              <h4>Production costing</h4>
+
+              <div className="production-metrics">
+                {[
+                  ['Material cost', run.material_cost],
+                  ['Labour cost', run.labour_cost],
+                  ['Energy cost', run.energy_cost],
+                  ['Total overhead', run.overhead],
+                  ['Total cost', run.total_cost],
+                  ['Cost per packet', run.cost_per_packet],
+                  ['Selling price', run.reference_selling_price],
+                  ['Profit per packet', run.profit_per_packet]
+                ].map(([label, value]) => (
+                  <div key={label}>
+                    <span>{label}</span>
+                    <strong>
+                      {displayMoney(value)}
+                    </strong>
+                  </div>
+                ))}
+
+                <div>
+                  <span>Gross margin</span>
+                  <strong className={
+                    Number(run.margin_pct) < 0
+                      ? 'variance-alert'
+                      : 'variance-normal'
+                  }>
+                    {run.margin_pct == null
+                      ? '—'
+                      : `${run.margin_pct}%`}
+                  </strong>
+                </div>
+              </div>
+
+              <p className="muted">
+                {run.historical_price
+                  ? 'Margin uses the selling price saved at production.'
+                  : 'Estimated margin uses the current master selling price.'}
+                {' GST is excluded.'}
+              </p>
             </section>
-          ))}
-        </>
+          );
+        })
       )}
     </Panel>
   );
 }
+
 
 function Dashboard({ role }: { role: Role }) { return <><div className="hero"><p className="eyebrow">WORKSPACE OVERVIEW</p><h2>Welcome back</h2><p className="muted">Signed in as {role.toLowerCase()}. Select a section to work with live operational data.</p></div><div className="tiles"><div className="tile"><ShoppingCart/><h3>Sales orders</h3><p>{role === 'SALESMAN' ? 'Create orders and track their status.' : 'Review orders and manage approvals.'}</p></div><div className="tile"><Factory/><h3>Production</h3><p>Record production runs and review material and yield variances.</p></div><div className="tile"><Receipt/><h3>Finance</h3><p>Review GST invoices, payments and outstanding receivables.</p></div></div></>; }
 function Shell({ session, logout }: { session: Session; logout: () => void }) {

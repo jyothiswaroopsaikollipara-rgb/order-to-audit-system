@@ -4,7 +4,7 @@ import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import {z} from 'zod';
-import {D,money,variance,tax} from './math.js';
+import {D,money,variance,tax,convertQuantity,varianceAlert,productionMargin} from './math.js';
 import { registerReports } from './reports.js';
 import {
   registerInvoicePdf,
@@ -33,9 +33,83 @@ app.post('/auth/login',route(async(req,res)=>{const {email,password}=z.object({e
 app.get('/stock',auth('ADMIN','PRODUCTION','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT * FROM stock_balances ORDER BY item_id')).rows)));
 app.get('/stock/ledger',auth('ADMIN','PRODUCTION','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT m.*,i.sku FROM stock_movements m JOIN items i ON i.id=m.item_id ORDER BY m.id')).rows)));
 app.get('/masters',auth('ADMIN','PRODUCTION','SALESMAN','OWNER'),route(async(req,res)=>{const [items,customers,boms]=await Promise.all([db.query('SELECT * FROM items ORDER BY id'),db.query('SELECT * FROM customers ORDER BY id'),db.query('SELECT * FROM bom')]);res.json({items:items.rows,customers:customers.rows,boms:boms.rows});}));
-app.get('/production/boms',
+
+app.post(
+  '/masters/items/:id/carton-ratio',
+  auth('ADMIN'),
+  route(async (req, res) => {
+    const data = z.object({
+      unitsPerCarton: z.number()
+        .int()
+        .positive()
+        .max(1000000)
+        .nullable()
+    }).parse(req.body);
+
+    const result = await tx(async c => {
+      await query(
+        c,
+        'SELECT id FROM inventory_mutex WHERE id = 1 FOR UPDATE'
+      );
+
+      const existing = await query(
+        c,
+        `SELECT id, sku, unit, units_per_carton
+         FROM items
+         WHERE id = $1
+         FOR UPDATE`,
+        [req.params.id]
+      );
+
+      if (!existing.rowCount) {
+        throw fail(404, 'Item not found');
+      }
+
+      const item = existing.rows[0];
+
+      if (!['piece', 'packet'].includes(item.unit)) {
+        throw fail(
+          400,
+          'Carton ratio requires a piece or packet based item'
+        );
+      }
+
+      const updated = await query(
+        c,
+        `UPDATE items
+         SET units_per_carton = $1
+         WHERE id = $2
+         RETURNING id, sku, unit, units_per_carton`,
+        [
+          data.unitsPerCarton,
+          item.id
+        ]
+      );
+
+      await audit(
+        c,
+        req.user.id,
+        'ITEM',
+        item.id,
+        'CARTON_RATIO_UPDATED',
+        {
+          before: item.units_per_carton,
+          after: updated.rows[0].units_per_carton
+        }
+      );
+
+      return updated.rows[0];
+    });
+
+    res.json(result);
+  })
+);
+
+app.get(
+  '/production/boms',
   auth('ADMIN', 'PRODUCTION'),
   route(async (req, res) => {
+
     const result = await db.query(`
       SELECT
         b.id,
@@ -43,36 +117,44 @@ app.get('/production/boms',
         finished.sku AS finished_product,
         l.item_id,
         l.planned_qty,
-        material.sku AS material_sku
+        material.sku AS material_sku,
+        material.unit,
+        material.units_per_carton
       FROM bom b
-      JOIN items finished ON finished.id = b.finished_item_id
-      JOIN bom_lines l ON l.bom_id = b.id
-      JOIN items material ON material.id = l.item_id
+      JOIN items finished
+        ON finished.id = b.finished_item_id
+      JOIN bom_lines l
+        ON l.bom_id = b.id
+      JOIN items material
+        ON material.id = l.item_id
       ORDER BY b.id, l.item_id
     `);
 
-    const map = new Map();
+    const grouped = new Map();
 
-    for (const r of result.rows) {
-      if (!map.has(r.id)) {
-        map.set(r.id, {
-          id: r.id,
-          expected_output: r.expected_output,
-          finished_product: r.finished_product,
+    for (const row of result.rows) {
+      if (!grouped.has(row.id)) {
+        grouped.set(row.id, {
+          id: row.id,
+          expected_output: row.expected_output,
+          finished_product: row.finished_product,
           lines: []
         });
       }
 
-      map.get(r.id).lines.push({
-        item_id: r.item_id,
-        planned_qty: r.planned_qty,
-        sku: r.material_sku
+      grouped.get(row.id).lines.push({
+        item_id: Number(row.item_id),
+        planned_qty: row.planned_qty,
+        sku: row.material_sku,
+        unit: row.unit,
+        units_per_carton: row.units_per_carton
       });
     }
 
-    res.json([...map.values()]);
+    res.json([...grouped.values()]);
   })
 );
+
 
 app.get(
   '/orders',
@@ -150,9 +232,649 @@ app.get('/invoices',
   })
 );
 
-app.post('/purchases',auth('ADMIN','PRODUCTION'),route(async(req,res)=>{const data=z.object({reference:text,itemId:id,quantity:qty,unitCost:qty}).parse(req.body);const result=await tx(async c=>{const old=await query(c,'SELECT * FROM purchases WHERE reference=$1',[data.reference]);if(old.rowCount)return {id:old.rows[0].id,replayed:true};const item=await query(c,'SELECT kind FROM items WHERE id=$1',[data.itemId]);if(!item.rowCount||item.rows[0].kind==='FINISHED')throw fail(400,'Purchase requires raw or packaging item');const r=await query(c,'INSERT INTO purchases(reference,item_id,qty,unit_cost) VALUES($1,$2,$3,$4) RETURNING id',[data.reference,data.itemId,data.quantity,data.unitCost]);const purchaseId=r.rows[0].id;await query(c,'INSERT INTO stock_movements(item_id,delta,source_type,source_id,line_key,unit_cost) VALUES($1,$2,$3,$4,$5,$6)',[data.itemId,data.quantity,'PURCHASE',purchaseId,'item',data.unitCost]);await audit(c,req.user.id,'PURCHASE',purchaseId,'POSTED');return {id:purchaseId,replayed:false};});res.status(result.replayed?200:201).json(result);}));
-app.post('/production-runs',auth('PRODUCTION','ADMIN'),route(async(req,res)=>{const data=z.object({requestKey:uuid,bomId:id,goodOutput:qty,issues:z.array(z.object({itemId:id,quantity:qty,damagedQty:z.optional(z.union([z.string(),z.number()]))})).min(1),labour:z.union([z.string(),z.number()]),energy:z.union([z.string(),z.number()])}).parse(req.body);if(D(data.labour).lt(0)||D(data.energy).lt(0))throw fail(400,'Overhead cannot be negative');const result=await tx(async c=>{const old=await query(c,'SELECT * FROM production_runs WHERE request_key=$1',[data.requestKey]);if(old.rowCount)return {run:old.rows[0],replayed:true};const bom=await query(c,'SELECT * FROM bom WHERE id=$1',[data.bomId]);if(!bom.rowCount)throw fail(404,'BOM not found');const lines=(await query(c,'SELECT * FROM bom_lines WHERE bom_id=$1',[data.bomId])).rows;const issueMap=new Map(data.issues.map(i=>[i.itemId,String(i.quantity)]));if(issueMap.size!==data.issues.length||lines.length!==data.issues.length||lines.some(l=>!issueMap.has(Number(l.item_id))))throw fail(400,'Issues must include each BOM line exactly once');let cost=D(0);const calculated=[];for(const l of lines){const issue=data.issues.find(x=>x.itemId===Number(l.item_id));const issued=D(issue.quantity);const damaged=D(issue.damagedQty??0);if(damaged.lt(0)||damaged.gt(issued))throw fail(400,'Invalid damaged quantity');const stock=await balance(c,l.item_id);if(stock.lt(issued))throw fail(409,`Insufficient stock for item ${l.item_id}`);const valuation=await query(c,`SELECT COALESCE(SUM(CASE WHEN source_type IN ('OPENING','PURCHASE') THEN delta*unit_cost ELSE 0 END),0)::text v, COALESCE(SUM(CASE WHEN source_type IN ('OPENING','PURCHASE') THEN delta ELSE 0 END),0)::text q FROM stock_movements WHERE item_id=$1`,[l.item_id]);const {v,q}=valuation.rows[0];const rate=D(q).isZero()?D(0):D(v).div(q);cost=cost.plus(issued.mul(rate));calculated.push({line:l,issued,damaged});}
-const overhead=D(data.labour).plus(data.energy);const total=cost.plus(overhead);const r=await query(c,'INSERT INTO production_runs(request_key,bom_id,good_output,expected_output,material_cost,overhead,cost_per_packet) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',[data.requestKey,data.bomId,data.goodOutput,bom.rows[0].expected_output,money(cost),money(overhead),money(total.div(data.goodOutput))]);const run=r.rows[0];for(const x of calculated){await debit(c,x.line.item_id,x.issued,'PRODUCTION_ISSUE',run.id,String(x.line.item_id),req.user.id);await query(c,'INSERT INTO production_issues(run_id,item_id,qty,damaged_qty,planned_qty,variance_pct) VALUES($1,$2,$3,$4,$5,$6)',[run.id,x.line.item_id,x.issued.toFixed(),x.damaged.toFixed(),x.line.planned_qty,variance(x.issued,x.line.planned_qty)]);}await query(c,'INSERT INTO stock_movements(item_id,delta,source_type,source_id,line_key) VALUES($1,$2,$3,$4,$5)',[bom.rows[0].finished_item_id,data.goodOutput,'PRODUCTION_OUTPUT',run.id,'good']);await audit(c,req.user.id,'PRODUCTION_RUN',run.id,'POSTED',{yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output)});return {run,yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output),replayed:false};});res.status(result.replayed?200:201).json(result);}));
+
+app.post(
+  '/purchases',
+  auth('ADMIN', 'PRODUCTION'),
+  route(async (req, res) => {
+    const data = z.object({
+      reference: text,
+      itemId: id,
+      quantity: qty,
+      unitCost: qty,
+      unit: z.string().trim().min(1).optional()
+    }).parse(req.body);
+
+    const result = await tx(async c => {
+      await query(
+        c,
+        'SELECT id FROM inventory_mutex WHERE id = 1 FOR UPDATE'
+      );
+
+      const itemResult = await query(
+        c,
+        `SELECT id, sku, kind, unit, units_per_carton
+         FROM items
+         WHERE id = $1`,
+        [data.itemId]
+      );
+
+      if (
+        !itemResult.rowCount ||
+        itemResult.rows[0].kind === 'FINISHED'
+      ) {
+        throw fail(
+          400,
+          'Purchase requires raw or packaging item'
+        );
+      }
+
+      const item = itemResult.rows[0];
+      const inputUnit = data.unit ?? item.unit;
+
+      let baseQuantity;
+      let baseUnitCost;
+      let purchaseValue;
+
+      try {
+        const inputQuantity = D(data.quantity);
+        const inputCost = D(data.unitCost);
+
+        baseQuantity = convertQuantity(
+          inputQuantity,
+          inputUnit,
+          item.unit,
+          item.units_per_carton
+        );
+
+        if (
+          !baseQuantity.gt(0) ||
+          !inputCost.isFinite() ||
+          !inputCost.gt(0)
+        ) {
+          throw new Error('Quantity and cost must be positive');
+        }
+
+        purchaseValue = inputQuantity.mul(inputCost);
+        baseUnitCost = purchaseValue.div(baseQuantity);
+
+      } catch (error) {
+        throw fail(400, error.message);
+      }
+
+      if (baseQuantity.decimalPlaces() > 4) {
+        throw fail(
+          400,
+          'Converted quantity exceeds four decimal places'
+        );
+      }
+
+      if (
+        ['piece', 'packet', 'carton'].includes(item.unit) &&
+        !baseQuantity.isInteger()
+      ) {
+        throw fail(400, 'Item requires whole units');
+      }
+
+      if (baseUnitCost.decimalPlaces() > 6) {
+        throw fail(
+          400,
+          'Converted unit cost exceeds six decimal places'
+        );
+      }
+
+      const old = await query(
+        c,
+        'SELECT * FROM purchases WHERE reference = $1',
+        [data.reference]
+      );
+
+      if (old.rowCount) {
+        const previous = old.rows[0];
+
+        if (
+          String(previous.item_id) !== String(data.itemId) ||
+          !D(previous.qty).eq(baseQuantity) ||
+          !D(previous.unit_cost).eq(baseUnitCost)
+        ) {
+          throw fail(
+            409,
+            'Purchase reference already used with different details'
+          );
+        }
+
+        return {
+          id: previous.id,
+          replayed: true
+        };
+      }
+
+      const r = await query(
+        c,
+        `INSERT INTO purchases (
+           reference, item_id, qty, unit_cost
+         )
+         VALUES ($1,$2,$3,$4)
+         RETURNING id`,
+        [
+          data.reference,
+          data.itemId,
+          baseQuantity.toFixed(),
+          baseUnitCost.toFixed()
+        ]
+      );
+
+      const purchaseId = r.rows[0].id;
+
+      await query(
+        c,
+        `INSERT INTO stock_movements (
+           item_id, delta, source_type,
+           source_id, line_key, unit_cost
+         )
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [
+          data.itemId,
+          baseQuantity.toFixed(),
+          'PURCHASE',
+          purchaseId,
+          'item',
+          baseUnitCost.toFixed()
+        ]
+      );
+
+      await audit(
+        c,
+        req.user.id,
+        'PURCHASE',
+        purchaseId,
+        'POSTED',
+        {
+          inputQuantity: String(data.quantity),
+          inputUnit,
+          inputUnitCost: String(data.unitCost),
+          baseQuantity: baseQuantity.toFixed(),
+          baseUnit: item.unit,
+          baseUnitCost: baseUnitCost.toFixed(),
+          purchaseValue: purchaseValue.toFixed()
+        }
+      );
+
+      return {
+        id: purchaseId,
+        replayed: false,
+        baseQuantity: baseQuantity.toFixed(),
+        baseUnit: item.unit,
+        baseUnitCost: baseUnitCost.toFixed(),
+        purchaseValue: purchaseValue.toFixed()
+      };
+    });
+
+    res.status(
+      result.replayed ? 200 : 201
+    ).json(result);
+  })
+);
+
+app.get(
+  '/production/settings',
+  auth('ADMIN', 'PRODUCTION', 'AUDITOR', 'OWNER'),
+  route(async (req, res) => {
+    const result = await db.query(
+      `SELECT variance_tolerance_pct
+       FROM production_settings
+       WHERE id = 1`
+    );
+
+    res.json(result.rows[0]);
+  })
+);
+
+app.post(
+  '/production/settings',
+  auth('ADMIN'),
+  route(async (req, res) => {
+    const data = z.object({
+      tolerancePct: z.coerce.number()
+        .min(0)
+        .max(100)
+        .refine(
+          n => D(n).decimalPlaces() <= 2,
+          'Maximum two decimal places'
+        )
+    }).parse(req.body);
+
+    const result = await tx(async c => {
+      const previous = await query(
+        c,
+        `SELECT variance_tolerance_pct
+         FROM production_settings
+         WHERE id = 1
+         FOR UPDATE`
+      );
+
+      const updated = await query(
+        c,
+        `UPDATE production_settings
+         SET variance_tolerance_pct = $1
+         WHERE id = 1
+         RETURNING variance_tolerance_pct`,
+        [data.tolerancePct]
+      );
+
+      await audit(
+        c,
+        req.user.id,
+        'PRODUCTION_SETTINGS',
+        1,
+        'UPDATED',
+        {
+          before: previous.rows[0],
+          after: updated.rows[0]
+        }
+      );
+
+      return updated.rows[0];
+    });
+
+    res.json(result);
+  })
+);
+
+
+app.post(
+  '/production-runs',
+  auth('PRODUCTION', 'ADMIN'),
+  route(async (req, res) => {
+
+    const numeric = z.union([
+      z.string().trim().min(1),
+      z.number()
+    ]);
+
+    const data = z.object({
+      requestKey: uuid,
+      bomId: id,
+      goodOutput: qty,
+      issues: z.array(z.object({
+        itemId: id,
+        quantity: qty,
+        damagedQty: numeric.optional(),
+        unit: z.string().trim().min(1).optional()
+      })).min(1),
+      labour: numeric,
+      energy: numeric
+    }).parse(req.body);
+
+    function nonnegative(value, label) {
+      let amount;
+
+      try {
+        amount = D(value);
+      } catch {
+        throw fail(400, `Invalid ${label}`);
+      }
+
+      if (!amount.isFinite() || amount.lt(0)) {
+        throw fail(400, `Invalid ${label}`);
+      }
+
+      return amount;
+    }
+
+    const labour = nonnegative(data.labour, 'labour');
+    const energy = nonnegative(data.energy, 'energy');
+
+    if (
+      labour.decimalPlaces() > 2 ||
+      energy.decimalPlaces() > 2
+    ) {
+      throw fail(400, 'Overhead requires two decimal places or fewer');
+    }
+
+    const result = await tx(async c => {
+
+      await query(
+        c,
+        'SELECT id FROM inventory_mutex WHERE id = 1 FOR UPDATE'
+      );
+
+      const old = await query(
+        c,
+        'SELECT * FROM production_runs WHERE request_key = $1',
+        [data.requestKey]
+      );
+
+      if (old.rowCount) {
+        return {
+          run: old.rows[0],
+          yieldVariancePct: variance(
+            old.rows[0].good_output,
+            old.rows[0].expected_output
+          ),
+          replayed: true
+        };
+      }
+
+      const bomResult = await query(
+        c,
+        `SELECT b.*, i.selling_price
+         FROM bom b
+         JOIN items i ON i.id = b.finished_item_id
+         WHERE b.id = $1`,
+        [data.bomId]
+      );
+
+      if (!bomResult.rowCount) {
+        throw fail(404, 'BOM not found');
+      }
+
+      const bom = bomResult.rows[0];
+
+      const settings = await query(
+        c,
+        `SELECT variance_tolerance_pct
+         FROM production_settings
+         WHERE id = 1`
+      );
+
+      const tolerance =
+        settings.rows[0].variance_tolerance_pct;
+
+      const lines = (
+        await query(
+          c,
+          `SELECT l.*, i.unit, i.sku,
+                  i.units_per_carton
+           FROM bom_lines l
+           JOIN items i ON i.id = l.item_id
+           WHERE l.bom_id = $1`,
+          [data.bomId]
+        )
+      ).rows;
+
+      const issueMap = new Map(
+        data.issues.map(issue => [
+          String(issue.itemId),
+          issue
+        ])
+      );
+
+      if (
+        issueMap.size !== data.issues.length ||
+        lines.length !== data.issues.length ||
+        lines.some(
+          l => !issueMap.has(String(l.item_id))
+        )
+      ) {
+        throw fail(
+          400,
+          'Issues must include each BOM line exactly once'
+        );
+      }
+
+      const output = D(data.goodOutput);
+
+      if (
+        !output.isFinite() ||
+        !output.gt(0) ||
+        !output.isInteger()
+      ) {
+        throw fail(400, 'Good output must be a positive whole number');
+      }
+
+      let cost = D(0);
+      const calculated = [];
+      const alerts = [];
+
+      for (const line of lines) {
+
+        const issue = issueMap.get(
+          String(line.item_id)
+        );
+
+        let issued;
+        let damaged;
+
+        try {
+          issued = convertQuantity(
+            issue.quantity,
+            issue.unit ?? line.unit,
+            line.unit,
+            line.units_per_carton
+          );
+
+          damaged = convertQuantity(
+            issue.damagedQty ?? 0,
+            issue.unit ?? line.unit,
+            line.unit,
+            line.units_per_carton
+          );
+        } catch (error) {
+          throw fail(
+            400,
+            `${line.sku}: ${error.message}`
+          );
+        }
+
+        if (
+          !issued.gt(0) ||
+          damaged.gt(issued) ||
+          issued.decimalPlaces() > 4 ||
+          damaged.decimalPlaces() > 4
+        ) {
+          throw fail(
+            400,
+            `Invalid issue quantity for ${line.sku}`
+          );
+        }
+
+        if (
+          ['piece', 'packet', 'carton'].includes(line.unit) &&
+          (!issued.isInteger() || !damaged.isInteger())
+        ) {
+          throw fail(
+            400,
+            `${line.sku} requires whole units`
+          );
+        }
+
+        const stock = await balance(c, line.item_id);
+
+        if (stock.lt(issued)) {
+          throw fail(
+            409,
+            `Insufficient stock for ${line.sku}`
+          );
+        }
+
+        const valuation = await query(
+          c,
+          `SELECT
+             COALESCE(SUM(
+               CASE WHEN source_type IN ('OPENING','PURCHASE')
+               THEN delta * unit_cost ELSE 0 END
+             ),0)::text AS v,
+             COALESCE(SUM(
+               CASE WHEN source_type IN ('OPENING','PURCHASE')
+               THEN delta ELSE 0 END
+             ),0)::text AS q
+           FROM stock_movements
+           WHERE item_id = $1`,
+          [line.item_id]
+        );
+
+        const { v, q } = valuation.rows[0];
+
+        const rate = D(q).isZero()
+          ? D(0)
+          : D(v).div(q);
+
+        cost = cost.plus(issued.mul(rate));
+
+        const variancePct = variance(
+          issued,
+          line.planned_qty
+        );
+
+        if (varianceAlert(variancePct, tolerance)) {
+          alerts.push({
+            type: 'MATERIAL',
+            sku: line.sku,
+            variancePct
+          });
+        }
+
+        calculated.push({
+          line,
+          issued,
+          damaged,
+          variancePct
+        });
+      }
+
+      const overhead = labour.plus(energy);
+      const total = cost.plus(overhead);
+
+      const yieldVariancePct = variance(
+        output,
+        bom.expected_output
+      );
+
+      if (varianceAlert(yieldVariancePct, tolerance)) {
+        alerts.push({
+          type: 'YIELD',
+          variancePct: yieldVariancePct
+        });
+      }
+
+      const r = await query(
+        c,
+        `INSERT INTO production_runs (
+           request_key,
+           bom_id,
+           good_output,
+           expected_output,
+           material_cost,
+           overhead,
+           cost_per_packet,
+           variance_tolerance_pct,
+           selling_price_snapshot,
+           labour_cost,
+           energy_cost
+         )
+         VALUES (
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+         )
+         RETURNING *`,
+        [
+          data.requestKey,
+          data.bomId,
+          output.toFixed(),
+          bom.expected_output,
+          money(cost),
+          money(overhead),
+          money(total.div(output)),
+          tolerance,
+          bom.selling_price,
+          money(labour),
+          money(energy)
+        ]
+      );
+
+      const run = r.rows[0];
+
+      for (const x of calculated) {
+        await debit(
+          c,
+          x.line.item_id,
+          x.issued,
+          'PRODUCTION_ISSUE',
+          run.id,
+          String(x.line.item_id),
+          req.user.id
+        );
+
+        await query(
+          c,
+          `INSERT INTO production_issues (
+             run_id,
+             item_id,
+             qty,
+             damaged_qty,
+             planned_qty,
+             variance_pct
+           )
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            run.id,
+            x.line.item_id,
+            x.issued.toFixed(),
+            x.damaged.toFixed(),
+            x.line.planned_qty,
+            x.variancePct
+          ]
+        );
+      }
+
+      await query(
+        c,
+        `INSERT INTO stock_movements (
+           item_id, delta, source_type,
+           source_id, line_key
+         )
+         VALUES ($1,$2,$3,$4,$5)`,
+        [
+          bom.finished_item_id,
+          output.toFixed(),
+          'PRODUCTION_OUTPUT',
+          run.id,
+          'good'
+        ]
+      );
+
+      const margin =
+        bom.selling_price != null &&
+        D(bom.selling_price).gt(0)
+          ? productionMargin(
+              cost,
+              overhead,
+              output,
+              bom.selling_price
+            )
+          : null;
+
+      await audit(
+        c,
+        req.user.id,
+        'PRODUCTION_RUN',
+        run.id,
+        'POSTED',
+        {
+          yieldVariancePct,
+          tolerancePct: tolerance,
+          alerts,
+          margin
+        }
+      );
+
+      return {
+        run,
+        yieldVariancePct,
+        tolerancePct: tolerance,
+        alerts,
+        margin,
+        replayed: false
+      };
+    });
+
+    res.status(
+      result.replayed ? 200 : 201
+    ).json(result);
+  })
+);
+
+//const overhead=D(data.labour).plus(data.energy);const total=cost.plus(overhead);const r=await query(c,'INSERT INTO production_runs(request_key,bom_id,good_output,expected_output,material_cost,overhead,cost_per_packet) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',[data.requestKey,data.bomId,data.goodOutput,bom.rows[0].expected_output,money(cost),money(overhead),money(total.div(data.goodOutput))]);const run=r.rows[0];for(const x of calculated){await debit(c,x.line.item_id,x.issued,'PRODUCTION_ISSUE',run.id,String(x.line.item_id),req.user.id);await query(c,'INSERT INTO production_issues(run_id,item_id,qty,damaged_qty,planned_qty,variance_pct) VALUES($1,$2,$3,$4,$5,$6)',[run.id,x.line.item_id,x.issued.toFixed(),x.damaged.toFixed(),x.line.planned_qty,variance(x.issued,x.line.planned_qty)]);}await query(c,'INSERT INTO stock_movements(item_id,delta,source_type,source_id,line_key) VALUES($1,$2,$3,$4,$5)',[bom.rows[0].finished_item_id,data.goodOutput,'PRODUCTION_OUTPUT',run.id,'good']);await audit(c,req.user.id,'PRODUCTION_RUN',run.id,'POSTED',{yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output)});return {run,yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output),replayed:false};});res.status(result.replayed?200:201).json(result);}));
 app.post('/orders',auth('SALESMAN'),route(async(req,res)=>{const d=z.object({requestKey:uuid,customerId:id,itemId:id,quantity:qty}).parse(req.body);const r=await db.query('INSERT INTO orders(request_key,customer_id,salesman_id,item_id,qty) VALUES($1,$2,$3,$4,$5) ON CONFLICT(request_key) DO UPDATE SET request_key=EXCLUDED.request_key RETURNING *',[d.requestKey,d.customerId,req.user.id,d.itemId,d.quantity]);if(String(r.rows[0].salesman_id)!==String(req.user.id))throw fail(403,'Order belongs to another salesman');res.status(201).json(r.rows[0]);}));
 
 app.post(
@@ -539,28 +1261,88 @@ app.post(
 app.post('/invoices/:id/dispatch',auth('ADMIN'),route(async(req,res)=>{const result=await tx(async c=>{const r=await query(c,'SELECT i.id invoice_id,o.* FROM invoices i JOIN orders o ON o.id=i.order_id WHERE i.id=$1 FOR UPDATE OF o',[req.params.id]);if(!r.rowCount)throw fail(404,'Invoice not found');const o=r.rows[0];const old=await query(c,'SELECT * FROM dispatches WHERE invoice_id=$1',[o.invoice_id]);if(old.rowCount)return old.rows[0];if(o.status!=='INVOICED')throw fail(409,'Invoice not ready to dispatch');const d=await query(c,'INSERT INTO dispatches(invoice_id) VALUES($1) RETURNING *',[o.invoice_id]);await debit(c,o.item_id,o.qty,'DISPATCH',d.rows[0].id,'item',req.user.id);await query(c,"UPDATE orders SET status='DISPATCHED' WHERE id=$1",[o.id]);await audit(c,req.user.id,'DISPATCH',d.rows[0].id,'POSTED');return d.rows[0];});res.json(result);}));
 app.post('/invoices/:id/payments',auth('ADMIN'),route(async(req,res)=>{const d=z.object({reference:text,amount:qty}).parse(req.body);const result=await tx(async c=>{const old=await query(c,'SELECT * FROM payments WHERE reference=$1',[d.reference]);if(old.rowCount)return old.rows[0];const inv=await query(c,'SELECT * FROM invoices WHERE id=$1',[req.params.id]);if(!inv.rowCount)throw fail(404,'Invoice not found');const paid=await query(c,'SELECT COALESCE(SUM(amount),0)::text n FROM payments WHERE invoice_id=$1',[req.params.id]);if(D(paid.rows[0].n).plus(d.amount).gt(inv.rows[0].total))throw fail(409,'Payment exceeds outstanding');const r=await query(c,'INSERT INTO payments(invoice_id,reference,amount) VALUES($1,$2,$3) RETURNING *',[req.params.id,d.reference,d.amount]);await audit(c,req.user.id,'PAYMENT',r.rows[0].id,'RECEIVED');return r.rows[0];});res.status(201).json(result);}));
 app.get('/reports/receivables',auth('ADMIN','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT i.id,i.invoice_no,i.total,COALESCE(SUM(p.amount),0)::numeric(18,2) paid,(i.total-COALESCE(SUM(p.amount),0))::numeric(18,2) outstanding FROM invoices i LEFT JOIN payments p ON p.invoice_id=i.id GROUP BY i.id ORDER BY i.id')).rows)));
+
 app.get(
   '/reports/production',
   auth('ADMIN', 'PRODUCTION', 'AUDITOR', 'OWNER'),
   route(async (req, res) => {
+
     const result = await db.query(`
       SELECT
         r.*,
         p.item_id,
         i.sku AS material_sku,
+        i.unit AS material_unit,
         p.qty,
         p.planned_qty,
         p.damaged_qty,
-        p.variance_pct
+        p.variance_pct,
+        finished.sku AS finished_product,
+        COALESCE(
+          r.selling_price_snapshot,
+          finished.selling_price
+        ) AS reference_selling_price,
+        COALESCE(
+          r.variance_tolerance_pct,
+          settings.variance_tolerance_pct
+        ) AS effective_tolerance
       FROM production_runs r
       JOIN production_issues p ON p.run_id = r.id
       JOIN items i ON i.id = p.item_id
-      ORDER BY r.id, p.item_id
+      JOIN bom b ON b.id = r.bom_id
+      JOIN items finished
+        ON finished.id = b.finished_item_id
+      CROSS JOIN production_settings settings
+      WHERE settings.id = 1
+      ORDER BY r.id DESC, p.item_id
     `);
 
-    res.json(result.rows);
+    const rows = result.rows.map(row => {
+
+      const yieldVariancePct = variance(
+        row.good_output,
+        row.expected_output
+      );
+
+      const margin =
+        row.reference_selling_price != null &&
+        D(row.reference_selling_price).gt(0)
+          ? productionMargin(
+              row.material_cost,
+              row.overhead,
+              row.good_output,
+              row.reference_selling_price
+            )
+          : null;
+
+      return {
+        ...row,
+        yield_variance_pct: yieldVariancePct,
+        yield_alert: varianceAlert(
+          yieldVariancePct,
+          row.effective_tolerance
+        ),
+        material_alert: varianceAlert(
+          row.variance_pct,
+          row.effective_tolerance
+        ),
+        profit_per_packet:
+          margin?.profitPerPacket ?? null,
+        margin_pct:
+          margin?.marginPct ?? null,
+        total_cost:
+          money(D(row.material_cost).plus(row.overhead)),
+        historical_price:
+          row.selling_price_snapshot != null,
+        historical_tolerance:
+          row.variance_tolerance_pct != null
+      };
+    });
+
+    res.json(rows);
   })
 );
+
 
 registerReports(app, db, auth, route);
 registerInvoicePdf(app, db, auth, route);
