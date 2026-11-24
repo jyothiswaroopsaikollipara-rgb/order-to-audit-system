@@ -1,3 +1,4 @@
+
 services:
   db:
     image: postgres:16-alpine
@@ -12,6 +13,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./sql/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+
   api:
     build: .
     environment:
@@ -19,10 +21,15 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       PORT: 3000
       DEMO_PASSWORD: ${DEMO_PASSWORD:?Set DEMO_PASSWORD in .env}
-    ports: ["127.0.0.1:3000:3000"]
+      SUPPLIER_NAME: ${SUPPLIER_NAME:-South Indian Snacks}
+      SUPPLIER_ADDRESS: ${SUPPLIER_ADDRESS:-Tamil Nadu, India}
+      SUPPLIER_GSTIN: ${SUPPLIER_GSTIN:-DEMO - Not registered}
+    ports:
+      - "127.0.0.1:3000:3000"
     depends_on:
       db:
         condition: service_healthy
-    command: sh -c "node src/seed.js && node src/server.js"
+    command: sh -c "node src/seed.js && node src/migrate.js && node src/server.js"
+
 volumes:
   pgdata:

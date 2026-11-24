@@ -147,6 +147,7 @@ function Invoices({
   );
 
   const [pdfBusy, setPdfBusy] = useState<number | null>(null);
+  const [shareBusy, setShareBusy] = useState<number | null>(null);
 
   // Download invoice PDF
   async function downloadPdf(inv: InvoiceV2) {
@@ -200,6 +201,97 @@ function Invoices({
       setPdfBusy(null);
     }
   }
+
+
+async function shareInvoice(inv: InvoiceV2) {
+  setShareBusy(inv.id);
+  setError('');
+  setSuccess('');
+
+  try {
+    const response = await fetch(
+      `/api/invoices/${inv.id}/pdf`,
+      {
+        headers: {
+          Authorization: `Bearer ${session.token}`
+        }
+      }
+    );
+
+    if (response.status === 401) {
+      onUnauthorized();
+      return;
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `Invoice sharing failed (${response.status})`
+      );
+    }
+
+    const blob = await response.blob();
+
+    const filename =
+      `${inv.invoice_no.replace(/[^a-zA-Z0-9_-]/g, '_')}.pdf`;
+
+    const file = new File(
+      [blob],
+      filename,
+      { type: 'application/pdf' }
+    );
+
+    const shareData = {
+      files: [file],
+      title: `Invoice ${inv.invoice_no}`,
+      text: `Invoice ${inv.invoice_no} from South Indian Snacks`
+    };
+
+    if (
+      typeof navigator.share === 'function' &&
+      typeof navigator.canShare === 'function' &&
+      navigator.canShare(shareData)
+    ) {
+      try {
+        await navigator.share(shareData);
+        setSuccess('Invoice handed to the sharing application.');
+        return;
+      } catch (e) {
+        if (
+          e instanceof DOMException &&
+          e.name === 'AbortError'
+        ) {
+          return;
+        }
+      }
+    }
+
+    // Fallback for unsupported desktop browsers
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    window.setTimeout(
+      () => URL.revokeObjectURL(url),
+      1000
+    );
+
+    setSuccess(
+      'Invoice downloaded. Attach the PDF in WhatsApp or email to share it with the customer.'
+    );
+
+  } catch (e) {
+    setError(messageOf(e));
+
+  } finally {
+    setShareBusy(null);
+  }
+}
 
   // Dispatch invoice
   async function dispatch(inv: InvoiceV2) {
@@ -358,17 +450,34 @@ function Invoices({
                   </td>
 
                   <td>
-                    <button
-                      type="button"
-                      className="secondary"
-                      disabled={pdfBusy !== null}
-                      onClick={() => downloadPdf(inv)}
-                    >
-                      {pdfBusy === inv.id
-                        ? 'Downloading…'
-                        : 'Download PDF'}
-                    </button>
-                  </td>
+  <div className="inline-actions">
+
+    <button
+      type="button"
+      className="secondary"
+      disabled={pdfBusy !== null}
+      onClick={() => downloadPdf(inv)}
+    >
+      {pdfBusy === inv.id
+        ? 'Downloading…'
+        : 'Download PDF'}
+    </button>
+
+    {session.role === 'ADMIN' && (
+      <button
+        type="button"
+        className="secondary"
+        disabled={shareBusy !== null}
+        onClick={() => shareInvoice(inv)}
+      >
+        {shareBusy === inv.id
+          ? 'Preparing…'
+          : 'Share Invoice'}
+      </button>
+    )}
+
+  </div>
+</td>
 
                   {session.role === 'ADMIN' && (
                     <td>
