@@ -2678,7 +2678,7 @@ function Dashboard({
 function Shell({ session, logout }: { session: Session; logout: () => void }) {
   const items = nav.filter(item => item.roles.includes(session.role));
   const allowed = (path: string) => items.some(x => x.path === path);
-  return <div className="app-shell"><aside className="sidebar"><div className="sidebar-brand"><div className="brand-mark"><ShieldCheck size={23}/></div><div><strong>Order to Audit</strong><small>Operations console</small></div></div><nav>{items.map(({path,label,icon:Icon})=><NavLink key={path} to={path} className={({isActive})=>isActive?'nav-link active':'nav-link'}><Icon size={18}/><span>{label}</span></NavLink>)}</nav><div className="sidebar-bottom"><span className="role-chip">{session.role}</span><button className="logout" onClick={logout}><LogOut size={17}/><span>Sign out</span></button></div></aside><main className="content"><header className="topbar"><span>Operations / {session.role.toLowerCase()}</span><span className="live-dot">API connected</span></header><div className="page"><Routes><Route path="/dashboard" element={<Dashboard
+  return <div className="app-shell"><aside className="sidebar"><div className="sidebar-brand"><div className="brand-mark"><ShieldCheck size={23}/></div><div><strong>Order to Audit</strong><small>Operations console</small></div></div><nav>{items.map(({path,label,icon:Icon})=><NavLink key={path} to={path} className={({isActive})=>isActive?'nav-link active':'nav-link'}><Icon size={18}/><span>{label}</span></NavLink>)}</nav><div className="sidebar-bottom"><span className="role-chip">{session.role}</span><button className="logout" onClick={logout}><LogOut size={17}/><span>Sign out</span></button></div></aside><main className="content"><header className="topbar"><span>Operations / {session.role.toLowerCase()}</span><span className="live-dot"><span>Operations workspace</span></span></header><div className="page"><Routes><Route path="/dashboard" element={<Dashboard
   session={session}
   onUnauthorized={logout}
 />}/><Route path="/new-order" element={allowed('/new-order')?<CreateOrder session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/orders" element={allowed('/orders')?<Orders session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/invoices" element={allowed('/invoices')?<Invoices session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/purchases" element={allowed('/purchases')?<PurchaseEntry session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/production" element={allowed('/production')?<ProductionEntry session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/production-report" element={allowed('/production-report')?<ProductionReport session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/stock-ledger" element={allowed('/stock-ledger')?<DataPage title="Stock movement ledger" path="/stock/ledger" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/stock" element={allowed('/stock')?<DataPage title="Current stock" path="/stock" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/receivables" element={allowed('/receivables')?<DataPage title="Receivables" path="/reports/receivables" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route
@@ -2704,6 +2704,10 @@ function Shell({ session, logout }: { session: Session; logout: () => void }) {
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
 
+  const logout = useCallback(() => {
+  setSession(null);
+}, []);
+
   return (
     <BrowserRouter>
       <Routes>
@@ -2724,7 +2728,7 @@ export default function App() {
             session ? (
               <Shell
                 session={session}
-                logout={() => setSession(null)}
+                logout={logout}
               />
             ) : (
               <Navigate to="/login" replace />
