@@ -22,6 +22,8 @@ type Props = {
 
 const reports = [
   { id: 'sales', label: 'Sales Register' },
+  { id: 'customer_sales', label: 'Customer-wise Sales' },
+  { id: 'product_sales', label: 'Product-wise Sales' },
   { id: 'gst', label: 'GST Summary' },
   { id: 'purchases', label: 'Purchase Register' },
   { id: 'stock', label: 'Stock Summary' },
@@ -30,6 +32,7 @@ const reports = [
   { id: 'materials', label: 'Material Consumption and Damage' },
   { id: 'collections', label: 'Payment Collections' },
   { id: 'receivables', label: 'Receivables and Ageing' },
+  { id: 'customer_ageing', label: 'Customer-wise Ageing' },
   { id: 'audit', label: 'Audit Trail' }
 ];
 
@@ -274,7 +277,10 @@ export default function ReportsCentre({
         </button>
       </form>
 
-      {type === 'receivables' && (
+      {(
+  type === 'receivables' ||
+  type === 'customer_ageing'
+) && (
         <p className="report-note">
           Receivables are calculated as of the selected
           end date. Ageing is based on invoice date,
@@ -333,7 +339,10 @@ export default function ReportsCentre({
             </p>
           )}
 
-          {result.report === 'receivables' && (
+          {(
+  result.report === 'receivables' ||
+  result.report === 'customer_ageing'
+) && (
             <p className="report-note">
               Outstanding balances as of {result.to}.
             </p>

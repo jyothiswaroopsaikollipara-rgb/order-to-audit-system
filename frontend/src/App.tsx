@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, NavLink, Route, Routes, useNavigate } from 're
 import { LayoutDashboard, LogOut, Package, Receipt, ShieldCheck, Factory, ShoppingCart, FileText, RefreshCw } from 'lucide-react';
 import './App.css';
 import ReportsCentre from './ReportsCentre';
+import BusinessDashboard from './BusinessDashboard';
 
 type Role = 'ADMIN' | 'SALESMAN' | 'PRODUCTION' | 'AUDITOR' | 'OWNER';
 type Session = { token: string; role: Role };
@@ -2551,11 +2552,106 @@ function ProductionReport({
 }
 
 
-function Dashboard({ role }: { role: Role }) { return <><div className="hero"><p className="eyebrow">WORKSPACE OVERVIEW</p><h2>Welcome back</h2><p className="muted">Signed in as {role.toLowerCase()}. Select a section to work with live operational data.</p></div><div className="tiles"><div className="tile"><ShoppingCart/><h3>Sales orders</h3><p>{role === 'SALESMAN' ? 'Create orders and track their status.' : 'Review orders and manage approvals.'}</p></div><div className="tile"><Factory/><h3>Production</h3><p>Record production runs and review material and yield variances.</p></div><div className="tile"><Receipt/><h3>Finance</h3><p>Review GST invoices, payments and outstanding receivables.</p></div></div></>; }
+
+function Dashboard({
+  session,
+  onUnauthorized
+}: {
+  session: Session;
+  onUnauthorized: () => void;
+}) {
+  const role = session.role;
+
+  if (
+    role === 'ADMIN' ||
+    role === 'OWNER' ||
+    role === 'SALESMAN'
+  ) {
+    return (
+      <BusinessDashboard
+        token={session.token}
+        role={role}
+        onUnauthorized={onUnauthorized}
+      />
+    );
+  }
+
+  return (
+    <>
+      <div className="hero">
+        <p className="eyebrow">WORKSPACE OVERVIEW</p>
+
+        <h2>Welcome back</h2>
+
+        <p className="muted">
+          Signed in as {role.toLowerCase()}.
+          Select a section to work with live operational data.
+        </p>
+      </div>
+
+      <div className="tiles">
+        {role === 'PRODUCTION' && (
+          <>
+            <div className="tile">
+              <Factory />
+              <h3>Production</h3>
+              <p>
+                Record production runs and review material
+                consumption and yield variances.
+              </p>
+            </div>
+
+            <div className="tile">
+              <Package />
+              <h3>Inventory</h3>
+              <p>
+                Record purchases and review current stock.
+              </p>
+            </div>
+          </>
+        )}
+
+        {role === 'AUDITOR' && (
+          <>
+            <div className="tile">
+              <FileText />
+              <h3>Reports and audit</h3>
+              <p>
+                Review operational reports and export
+                audit records.
+              </p>
+            </div>
+
+            <div className="tile">
+              <Receipt />
+              <h3>Finance</h3>
+              <p>
+                Review GST invoices, collections
+                and outstanding receivables.
+              </p>
+            </div>
+
+            <div className="tile">
+              <Package />
+              <h3>Inventory</h3>
+              <p>
+                Review stock balances and movement ledgers.
+              </p>
+            </div>
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
 function Shell({ session, logout }: { session: Session; logout: () => void }) {
   const items = nav.filter(item => item.roles.includes(session.role));
   const allowed = (path: string) => items.some(x => x.path === path);
-  return <div className="app-shell"><aside className="sidebar"><div className="sidebar-brand"><div className="brand-mark"><ShieldCheck size={23}/></div><div><strong>Order to Audit</strong><small>Operations console</small></div></div><nav>{items.map(({path,label,icon:Icon})=><NavLink key={path} to={path} className={({isActive})=>isActive?'nav-link active':'nav-link'}><Icon size={18}/><span>{label}</span></NavLink>)}</nav><div className="sidebar-bottom"><span className="role-chip">{session.role}</span><button className="logout" onClick={logout}><LogOut size={17}/><span>Sign out</span></button></div></aside><main className="content"><header className="topbar"><span>Operations / {session.role.toLowerCase()}</span><span className="live-dot">API connected</span></header><div className="page"><Routes><Route path="/dashboard" element={<Dashboard role={session.role}/>}/><Route path="/new-order" element={allowed('/new-order')?<CreateOrder session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/orders" element={allowed('/orders')?<Orders session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/invoices" element={allowed('/invoices')?<Invoices session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/purchases" element={allowed('/purchases')?<PurchaseEntry session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/production" element={allowed('/production')?<ProductionEntry session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/production-report" element={allowed('/production-report')?<ProductionReport session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/stock-ledger" element={allowed('/stock-ledger')?<DataPage title="Stock movement ledger" path="/stock/ledger" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/stock" element={allowed('/stock')?<DataPage title="Current stock" path="/stock" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/receivables" element={allowed('/receivables')?<DataPage title="Receivables" path="/reports/receivables" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route
+  return <div className="app-shell"><aside className="sidebar"><div className="sidebar-brand"><div className="brand-mark"><ShieldCheck size={23}/></div><div><strong>Order to Audit</strong><small>Operations console</small></div></div><nav>{items.map(({path,label,icon:Icon})=><NavLink key={path} to={path} className={({isActive})=>isActive?'nav-link active':'nav-link'}><Icon size={18}/><span>{label}</span></NavLink>)}</nav><div className="sidebar-bottom"><span className="role-chip">{session.role}</span><button className="logout" onClick={logout}><LogOut size={17}/><span>Sign out</span></button></div></aside><main className="content"><header className="topbar"><span>Operations / {session.role.toLowerCase()}</span><span className="live-dot">API connected</span></header><div className="page"><Routes><Route path="/dashboard" element={<Dashboard
+  session={session}
+  onUnauthorized={logout}
+/>}/><Route path="/new-order" element={allowed('/new-order')?<CreateOrder session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/orders" element={allowed('/orders')?<Orders session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/invoices" element={allowed('/invoices')?<Invoices session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/purchases" element={allowed('/purchases')?<PurchaseEntry session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/production" element={allowed('/production')?<ProductionEntry session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/production-report" element={allowed('/production-report')?<ProductionReport session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/stock-ledger" element={allowed('/stock-ledger')?<DataPage title="Stock movement ledger" path="/stock/ledger" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/stock" element={allowed('/stock')?<DataPage title="Current stock" path="/stock" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route path="/receivables" element={allowed('/receivables')?<DataPage title="Receivables" path="/reports/receivables" session={session} onUnauthorized={logout}/>:<Navigate to="/dashboard" replace/>}/><Route
   path="/reports"
   element={
     allowed('/reports') ? (

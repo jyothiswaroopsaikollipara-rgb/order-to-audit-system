@@ -1,5 +1,101 @@
 export function registerReports(app, db, auth, route) {
   const queries = {
+
+    customer_sales: `
+      SELECT
+        c.id AS customer_id,
+        c.name AS customer,
+        COUNT(i.id) AS invoice_count,
+        SUM(o.qty) AS quantity,
+        SUM(i.taxable) AS taxable_sales,
+        SUM(i.cgst) AS cgst,
+        SUM(i.sgst) AS sgst,
+        SUM(i.igst) AS igst,
+        SUM(i.total) AS invoice_total
+      FROM invoices i
+      JOIN orders o ON o.id = i.order_id
+      JOIN customers c ON c.id = o.customer_id
+      WHERE i.created_at >= $1
+        AND i.created_at < $2
+      GROUP BY c.id, c.name
+      ORDER BY invoice_total DESC, c.name
+    `,
+
+    product_sales: `
+      SELECT
+        p.id AS item_id,
+        p.sku AS product,
+        p.name,
+        p.unit,
+        COUNT(i.id) AS invoice_count,
+        SUM(o.qty) AS quantity,
+        SUM(i.taxable) AS taxable_sales,
+        SUM(i.cgst) AS cgst,
+        SUM(i.sgst) AS sgst,
+        SUM(i.igst) AS igst,
+        SUM(i.total) AS invoice_total
+      FROM invoices i
+      JOIN orders o ON o.id = i.order_id
+      JOIN items p ON p.id = o.item_id
+      WHERE i.created_at >= $1
+        AND i.created_at < $2
+      GROUP BY p.id, p.sku, p.name, p.unit
+      ORDER BY invoice_total DESC, p.sku
+    `,
+
+    customer_ageing: `
+      WITH balances AS (
+        SELECT
+          i.id,
+          c.id AS customer_id,
+          c.name AS customer,
+          i.total,
+          COALESCE(SUM(p.amount), 0) AS paid,
+          i.total - COALESCE(SUM(p.amount), 0)
+            AS outstanding,
+          (
+            ($2::timestamptz AT TIME ZONE 'Asia/Kolkata')::date
+            - 1
+            -
+            (i.created_at AT TIME ZONE 'Asia/Kolkata')::date
+          ) AS age_days
+        FROM invoices i
+        JOIN orders o ON o.id = i.order_id
+        JOIN customers c ON c.id = o.customer_id
+        LEFT JOIN payments p
+          ON p.invoice_id = i.id
+          AND p.created_at < $2
+        WHERE i.created_at < $2
+          AND $1::timestamptz < $2::timestamptz
+        GROUP BY i.id, c.id, c.name
+      )
+      SELECT
+        customer_id,
+        customer,
+        SUM(total) AS invoiced,
+        SUM(paid) AS collected,
+        SUM(outstanding) AS outstanding,
+        COALESCE(SUM(outstanding) FILTER (
+          WHERE age_days <= 30
+            AND outstanding > 0
+        ), 0) AS ageing_0_30,
+        COALESCE(SUM(outstanding) FILTER (
+          WHERE age_days BETWEEN 31 AND 60
+            AND outstanding > 0
+        ), 0) AS ageing_31_60,
+        COALESCE(SUM(outstanding) FILTER (
+          WHERE age_days BETWEEN 61 AND 90
+            AND outstanding > 0
+        ), 0) AS ageing_61_90,
+        COALESCE(SUM(outstanding) FILTER (
+          WHERE age_days > 90
+            AND outstanding > 0
+        ), 0) AS ageing_over_90
+      FROM balances
+      GROUP BY customer_id, customer
+      ORDER BY outstanding DESC, customer
+    `,
+
     sales: `
       SELECT
         i.invoice_no,
