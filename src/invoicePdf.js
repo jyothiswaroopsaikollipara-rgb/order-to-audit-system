@@ -9,20 +9,54 @@ export const supplier = {
   state_code: '33'
 };
 
+export function financialYearPrefix(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: 'numeric'
+  }).formatToParts(date);
+
+  const year = Number(
+    parts.find(p => p.type === 'year').value
+  );
+
+  const month = Number(
+    parts.find(p => p.type === 'month').value
+  );
+
+  const startYear = month >= 4 ? year : year - 1;
+
+  return `FY${String(startYear).slice(-2)}`;
+}
+
 export function billingSnapshot(row) {
   return {
-    supplier: { ...supplier },
+    supplier: {
+      ...supplier
+    },
+
     customer: {
       name: row.customer_name,
       address: row.customer_address || 'Not provided',
       gstin: row.customer_gstin || 'Not provided',
       state_code: row.state_code
     },
+
     product: {
       sku: row.sku,
       name: row.product_name,
       hsn_code: row.hsn_code || 'Not configured',
       unit: row.unit
+    },
+
+    pricing: {
+      quantity: String(row.qty),
+      unit_price: row.selling_price == null
+        ? null
+        : String(row.selling_price),
+      gst_rate: row.gst_rate == null
+        ? null
+        : String(row.gst_rate)
     }
   };
 }

@@ -6,7 +6,11 @@ import jwt from 'jsonwebtoken';
 import {z} from 'zod';
 import {D,money,variance,tax} from './math.js';
 import { registerReports } from './reports.js';
-import { registerInvoicePdf } from './invoicePdf.js';
+import {
+  registerInvoicePdf,
+  financialYearPrefix,
+  billingSnapshot
+} from './invoicePdf.js';
 
 if(!process.env.JWT_SECRET || process.env.JWT_SECRET.length<32 || !process.env.DATABASE_URL) throw Error('DATABASE_URL and JWT_SECRET (32+ characters) required');
 const db=new pg.Pool({connectionString:process.env.DATABASE_URL});
@@ -132,7 +136,137 @@ app.post('/production-runs',auth('PRODUCTION','ADMIN'),route(async(req,res)=>{co
 const overhead=D(data.labour).plus(data.energy);const total=cost.plus(overhead);const r=await query(c,'INSERT INTO production_runs(request_key,bom_id,good_output,expected_output,material_cost,overhead,cost_per_packet) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',[data.requestKey,data.bomId,data.goodOutput,bom.rows[0].expected_output,money(cost),money(overhead),money(total.div(data.goodOutput))]);const run=r.rows[0];for(const x of calculated){await debit(c,x.line.item_id,x.issued,'PRODUCTION_ISSUE',run.id,String(x.line.item_id),req.user.id);await query(c,'INSERT INTO production_issues(run_id,item_id,qty,damaged_qty,planned_qty,variance_pct) VALUES($1,$2,$3,$4,$5,$6)',[run.id,x.line.item_id,x.issued.toFixed(),x.damaged.toFixed(),x.line.planned_qty,variance(x.issued,x.line.planned_qty)]);}await query(c,'INSERT INTO stock_movements(item_id,delta,source_type,source_id,line_key) VALUES($1,$2,$3,$4,$5)',[bom.rows[0].finished_item_id,data.goodOutput,'PRODUCTION_OUTPUT',run.id,'good']);await audit(c,req.user.id,'PRODUCTION_RUN',run.id,'POSTED',{yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output)});return {run,yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output),replayed:false};});res.status(result.replayed?200:201).json(result);}));
 app.post('/orders',auth('SALESMAN'),route(async(req,res)=>{const d=z.object({requestKey:uuid,customerId:id,itemId:id,quantity:qty}).parse(req.body);const r=await db.query('INSERT INTO orders(request_key,customer_id,salesman_id,item_id,qty) VALUES($1,$2,$3,$4,$5) ON CONFLICT(request_key) DO UPDATE SET request_key=EXCLUDED.request_key RETURNING *',[d.requestKey,d.customerId,req.user.id,d.itemId,d.quantity]);if(String(r.rows[0].salesman_id)!==String(req.user.id))throw fail(403,'Order belongs to another salesman');res.status(201).json(r.rows[0]);}));
 app.post('/orders/:id/approve',auth('ADMIN'),route(async(req,res)=>{const result=await tx(async c=>{const r=await query(c,'SELECT * FROM orders WHERE id=$1 FOR UPDATE',[req.params.id]);if(!r.rowCount)throw fail(404,'Order not found');const o=r.rows[0];if(o.status==='APPROVED')return {status:o.status};if(o.status!=='SUBMITTED')throw fail(409,'Order cannot be approved');const stock=await balance(c,o.item_id);if(stock.lt(o.qty))throw fail(409,`Shortage: ${D(o.qty).minus(stock).toFixed()} packets`);await query(c,"UPDATE orders SET status='APPROVED' WHERE id=$1",[o.id]);await audit(c,req.user.id,'ORDER',o.id,'APPROVED');return {status:'APPROVED'};});res.json(result);}));
-app.post('/orders/:id/invoice',auth('ADMIN'),route(async(req,res)=>{const result=await tx(async c=>{const r=await query(c,'SELECT o.*,i.selling_price,i.gst_rate,cu.state_code FROM orders o JOIN items i ON i.id=o.item_id JOIN customers cu ON cu.id=o.customer_id WHERE o.id=$1 FOR UPDATE OF o',[req.params.id]);if(!r.rowCount)throw fail(404,'Order not found');const o=r.rows[0];const old=await query(c,'SELECT * FROM invoices WHERE order_id=$1',[o.id]);if(old.rowCount)return old.rows[0];if(o.status!=='APPROVED')throw fail(409,'Order must be approved');const t=tax(o.qty,o.selling_price,o.gst_rate,o.state_code==='33');const number=`FY26-${String(o.id).padStart(5,'0')}`;const inv=await query(c,'INSERT INTO invoices(order_id,invoice_no,taxable,cgst,sgst,igst,total) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',[o.id,number,t.taxable,t.cgst,t.sgst,t.igst,t.total]);await query(c,"UPDATE orders SET status='INVOICED' WHERE id=$1",[o.id]);await audit(c,req.user.id,'INVOICE',inv.rows[0].id,'ISSUED');return inv.rows[0];});res.json(result);}));
+
+
+app.post(
+  '/orders/:id/invoice',
+  auth('ADMIN'),
+  route(async (req, res) => {
+
+    const result = await tx(async c => {
+
+      // Retrieve and lock the order
+      const r = await query(
+        c,
+        `SELECT
+          o.*,
+          i.selling_price,
+          i.gst_rate,
+          i.sku,
+          i.name AS product_name,
+          i.hsn_code,
+          i.unit,
+          cu.name AS customer_name,
+          cu.address AS customer_address,
+          cu.gstin AS customer_gstin,
+          cu.state_code
+        FROM orders o
+        JOIN items i ON i.id = o.item_id
+        JOIN customers cu ON cu.id = o.customer_id
+        WHERE o.id = $1
+        FOR UPDATE OF o`,
+        [req.params.id]
+      );
+
+      if (!r.rowCount) {
+        throw fail(404, 'Order not found');
+      }
+
+      const o = r.rows[0];
+
+      // Prevent duplicate invoice generation
+      const old = await query(
+        c,
+        'SELECT * FROM invoices WHERE order_id = $1',
+        [o.id]
+      );
+
+      if (old.rowCount) {
+        return old.rows[0];
+      }
+
+      if (o.status !== 'APPROVED') {
+        throw fail(409, 'Order must be approved');
+      }
+
+      // GST calculation
+      const t = tax(
+        o.qty,
+        o.selling_price,
+        o.gst_rate,
+        o.state_code === '33'
+      );
+
+      // Use the same timestamp for numbering and storage
+      const issuedAt = new Date();
+
+      // Automatic financial-year invoice number
+      const number =
+        `${financialYearPrefix(issuedAt)}-${String(o.id).padStart(5, '0')}`;
+
+      // Preserve billing details at issuance
+      const snapshot = billingSnapshot(o);
+
+      const invoiceQuantity = snapshot.pricing?.quantity ?? inv.qty;
+
+      const invoiceUnitPrice = snapshot.pricing?.unit_price ?? new Decimal(inv.taxable).div(invoiceQuantity).toFixed(2);
+
+      // Create invoice
+      const inv = await query(
+        c,
+        `INSERT INTO invoices (
+          order_id,
+          invoice_no,
+          taxable,
+          cgst,
+          sgst,
+          igst,
+          total,
+          billing_snapshot,
+          created_at
+        )
+        VALUES (
+          $1, $2, $3, $4, $5,
+          $6, $7, $8::jsonb, $9
+        )
+        RETURNING *`,
+        [
+          o.id,
+          number,
+          t.taxable,
+          t.cgst,
+          t.sgst,
+          t.igst,
+          t.total,
+          JSON.stringify(snapshot),
+          issuedAt
+        ]
+      );
+
+      // Update order status
+      await query(
+        c,
+        "UPDATE orders SET status = 'INVOICED' WHERE id = $1",
+        [o.id]
+      );
+
+      // Record audit event
+      await audit(
+        c,
+        req.user.id,
+        'INVOICE',
+        inv.rows[0].id,
+        'ISSUED'
+      );
+
+      return inv.rows[0];
+
+    });
+
+    res.json(result);
+
+  })
+);
 app.post('/invoices/:id/dispatch',auth('ADMIN'),route(async(req,res)=>{const result=await tx(async c=>{const r=await query(c,'SELECT i.id invoice_id,o.* FROM invoices i JOIN orders o ON o.id=i.order_id WHERE i.id=$1 FOR UPDATE OF o',[req.params.id]);if(!r.rowCount)throw fail(404,'Invoice not found');const o=r.rows[0];const old=await query(c,'SELECT * FROM dispatches WHERE invoice_id=$1',[o.invoice_id]);if(old.rowCount)return old.rows[0];if(o.status!=='INVOICED')throw fail(409,'Invoice not ready to dispatch');const d=await query(c,'INSERT INTO dispatches(invoice_id) VALUES($1) RETURNING *',[o.invoice_id]);await debit(c,o.item_id,o.qty,'DISPATCH',d.rows[0].id,'item',req.user.id);await query(c,"UPDATE orders SET status='DISPATCHED' WHERE id=$1",[o.id]);await audit(c,req.user.id,'DISPATCH',d.rows[0].id,'POSTED');return d.rows[0];});res.json(result);}));
 app.post('/invoices/:id/payments',auth('ADMIN'),route(async(req,res)=>{const d=z.object({reference:text,amount:qty}).parse(req.body);const result=await tx(async c=>{const old=await query(c,'SELECT * FROM payments WHERE reference=$1',[d.reference]);if(old.rowCount)return old.rows[0];const inv=await query(c,'SELECT * FROM invoices WHERE id=$1',[req.params.id]);if(!inv.rowCount)throw fail(404,'Invoice not found');const paid=await query(c,'SELECT COALESCE(SUM(amount),0)::text n FROM payments WHERE invoice_id=$1',[req.params.id]);if(D(paid.rows[0].n).plus(d.amount).gt(inv.rows[0].total))throw fail(409,'Payment exceeds outstanding');const r=await query(c,'INSERT INTO payments(invoice_id,reference,amount) VALUES($1,$2,$3) RETURNING *',[req.params.id,d.reference,d.amount]);await audit(c,req.user.id,'PAYMENT',r.rows[0].id,'RECEIVED');return r.rows[0];});res.status(201).json(result);}));
 app.get('/reports/receivables',auth('ADMIN','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT i.id,i.invoice_no,i.total,COALESCE(SUM(p.amount),0)::numeric(18,2) paid,(i.total-COALESCE(SUM(p.amount),0))::numeric(18,2) outstanding FROM invoices i LEFT JOIN payments p ON p.invoice_id=i.id GROUP BY i.id ORDER BY i.id')).rows)));
