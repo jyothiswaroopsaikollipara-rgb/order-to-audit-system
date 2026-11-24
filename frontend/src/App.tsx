@@ -7,7 +7,21 @@ import ReportsCentre from './ReportsCentre';
 
 type Role = 'ADMIN' | 'SALESMAN' | 'PRODUCTION' | 'AUDITOR' | 'OWNER';
 type Session = { token: string; role: Role };
-type Order = { id: number; customer_id: number; customer_name: string; salesman_id: number; item_id: number; sku: string; qty: string; status: string };
+type Order = {
+  id: number;
+  customer_id: number;
+  customer_name: string;
+  salesman_id: number;
+  item_id: number;
+  sku: string;
+  qty: string;
+  status: string;
+  unit_price: string | null;
+  order_value: string | null;
+  rejection_reason: string | null;
+  created_at: string;
+  updated_at: string | null;
+};
 type Invoice = { id: number; invoice_no: string; order_id: number; customer_name: string; taxable: string; cgst: string; sgst: string; igst: string; total: string; paid: string; outstanding: string };
 type Masters = { items: { id: number; sku: string; kind: string }[]; customers: { id: number; name: string }[]; boms: { id: number; finished_item_id: number; expected_output: string }[] };
 type BomLine = { item_id: number; planned_qty: string; sku: string };
@@ -103,17 +117,436 @@ function CreateOrder({ session, onUnauthorized }: { session: Session; onUnauthor
   }
   return <Panel title="Create sales order"><p className="muted">Submit an order for admin review. Stock is checked when the admin approves it.</p><Alert error={masterError || error} success={success}/>{loading ? <p className="muted">Loading customers and products…</p> : <form className="business-form" onSubmit={submit}><label htmlFor="customer">Customer</label><select id="customer" required value={customerId} onChange={e=>setCustomerId(e.target.value)}><option value="">Select customer</option>{masters?.customers.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select><label htmlFor="product">Finished product</label><select id="product" required value={itemId} onChange={e=>setItemId(e.target.value)}><option value="">Select product</option>{products.map(p=><option key={p.id} value={p.id}>{p.sku}</option>)}</select><label htmlFor="quantity">Quantity (packets)</label><input id="quantity" type="number" min="0.0001" step="any" required value={quantity} onChange={e=>setQuantity(e.target.value)} placeholder="e.g. 120"/><button className="primary" disabled={pending || !masters?.customers.length || !products.length}>{pending ? 'Submitting…' : 'Submit order'}</button></form>}</Panel>;
 }
-function Orders({ session, onUnauthorized }: { session: Session; onUnauthorized: () => void }) {
-  const { data, error: loadError, loading, refresh } = useRemote<Order[]>('/orders', session, onUnauthorized);
-  const [busy, setBusy] = useState<number | null>(null); const [error, setError] = useState(''); const [success, setSuccess] = useState('');
-  async function act(order: Order, action: 'approve' | 'invoice') {
-    if (!window.confirm(`${action === 'approve' ? 'Approve' : 'Generate invoice for'} order #${order.id}?`)) return;
-    setBusy(order.id); setError(''); setSuccess('');
-    try { await api<unknown>(`/orders/${order.id}/${action}`, session.token, 'POST'); setSuccess(`Order #${order.id}: ${action === 'approve' ? 'approved' : 'invoice issued'}.`); refresh(); }
-    catch (e) { const msg = messageOf(e); setError(msg); if (msg.includes('Session expired')) onUnauthorized(); }
-    finally { setBusy(null); }
+
+function Orders({
+  session,
+  onUnauthorized
+}: {
+  session: Session;
+  onUnauthorized: () => void;
+}) {
+  const {
+    data,
+    error: loadError,
+    loading,
+    refresh
+  } = useRemote<Order[]>(
+    '/orders',
+    session,
+    onUnauthorized
+  );
+
+  const [busy, setBusy] = useState<number | null>(null);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  const [editOrder, setEditOrder] =
+    useState<Order | null>(null);
+
+  const [rejectOrder, setRejectOrder] =
+    useState<Order | null>(null);
+
+  const [quantity, setQuantity] = useState('');
+  const [unitPrice, setUnitPrice] = useState('');
+  const [reason, setReason] = useState('');
+
+  const isAdmin = session.role === 'ADMIN';
+
+  function handleError(e: unknown) {
+    const msg = messageOf(e);
+    setError(msg);
+
+    if (msg.includes('Session expired')) {
+      onUnauthorized();
+    }
   }
-  return <Panel title={session.role === 'SALESMAN' ? 'My orders' : 'Sales orders'} onRefresh={refresh}><Alert error={loadError || error} success={success}/>{loading ? <p className="muted">Loading orders…</p> : !data?.length ? <p className="muted">No orders found.</p> : <div className="table-wrap"><table><thead><tr><th>ID</th><th>Customer</th><th>Product</th><th>Quantity</th><th>Status</th>{session.role === 'ADMIN' && <th>Actions</th>}</tr></thead><tbody>{data.map(o=><tr key={o.id}><td>#{o.id}</td><td>{o.customer_name}</td><td>{o.sku}</td><td>{o.qty}</td><td><span className="status-chip">{o.status}</span></td>{session.role === 'ADMIN' && <td><div className="inline-actions">{o.status === 'SUBMITTED' && <button className="secondary" disabled={busy !== null} onClick={()=>act(o,'approve')}>Approve</button>}{o.status === 'APPROVED' && <button className="secondary" disabled={busy !== null} onClick={()=>act(o,'invoice')}>Issue invoice</button>}{!['SUBMITTED','APPROVED'].includes(o.status) && <span className="muted">—</span>}</div></td>}</tr>)}</tbody></table></div>}</Panel>;
+
+  async function act(
+    order: Order,
+    action: 'approve' | 'invoice'
+  ) {
+    if (
+      !window.confirm(
+        `${action === 'approve'
+          ? 'Approve'
+          : 'Generate invoice for'} order #${order.id}?`
+      )
+    ) return;
+
+    setBusy(order.id);
+    setError('');
+    setSuccess('');
+
+    try {
+      await api<unknown>(
+        `/orders/${order.id}/${action}`,
+        session.token,
+        'POST'
+      );
+
+      setSuccess(
+        `Order #${order.id}: ${
+          action === 'approve'
+            ? 'approved'
+            : 'invoice issued'
+        }.`
+      );
+
+      refresh();
+
+    } catch (e) {
+      handleError(e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function openEdit(order: Order) {
+    setRejectOrder(null);
+    setEditOrder(order);
+    setQuantity(String(order.qty));
+    setUnitPrice(String(order.unit_price ?? ''));
+    setError('');
+    setSuccess('');
+  }
+
+  function openReject(order: Order) {
+    setEditOrder(null);
+    setRejectOrder(order);
+    setReason('');
+    setError('');
+    setSuccess('');
+  }
+
+  async function saveEdit(event: FormEvent) {
+    event.preventDefault();
+
+    if (!editOrder) return;
+
+    if (
+      !isPositive(quantity) ||
+      !isPositive(unitPrice)
+    ) {
+      setError('Enter a valid quantity and unit price.');
+      return;
+    }
+
+    setBusy(editOrder.id);
+    setError('');
+    setSuccess('');
+
+    try {
+      await api<unknown>(
+        `/orders/${editOrder.id}/edit`,
+        session.token,
+        'POST',
+        {
+          quantity,
+          unitPrice
+        }
+      );
+
+      setSuccess(
+        `Order #${editOrder.id} updated successfully.`
+      );
+
+      setEditOrder(null);
+      refresh();
+
+    } catch (e) {
+      handleError(e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveReject(event: FormEvent) {
+    event.preventDefault();
+
+    if (!rejectOrder) return;
+
+    if (reason.trim().length < 3) {
+      setError('Enter a valid rejection reason.');
+      return;
+    }
+
+    if (
+      !window.confirm(
+        `Reject order #${rejectOrder.id}?`
+      )
+    ) return;
+
+    setBusy(rejectOrder.id);
+    setError('');
+    setSuccess('');
+
+    try {
+      await api<unknown>(
+        `/orders/${rejectOrder.id}/reject`,
+        session.token,
+        'POST',
+        {
+          reason: reason.trim()
+        }
+      );
+
+      setSuccess(
+        `Order #${rejectOrder.id} rejected.`
+      );
+
+      setRejectOrder(null);
+      refresh();
+
+    } catch (e) {
+      handleError(e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Panel
+      title={
+        session.role === 'SALESMAN'
+          ? 'My orders'
+          : 'Sales orders'
+      }
+      onRefresh={refresh}
+    >
+      <Alert
+        error={loadError || error}
+        success={success}
+      />
+
+      {loading ? (
+        <p className="muted">Loading orders...</p>
+      ) : !data?.length ? (
+        <p className="muted">No orders found.</p>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Customer</th>
+                <th>Product</th>
+                <th>Quantity</th>
+                <th>Unit price (₹)</th>
+                <th>Order value (₹)</th>
+                <th>Status</th>
+                <th>Rejection reason</th>
+                {isAdmin && <th>Actions</th>}
+              </tr>
+            </thead>
+
+            <tbody>
+              {data.map(o => (
+                <tr key={o.id}>
+                  <td>#{o.id}</td>
+                  <td>{o.customer_name}</td>
+                  <td>{o.sku}</td>
+                  <td>{o.qty}</td>
+
+                  <td>
+                    {o.unit_price == null
+                      ? '—'
+                      : Number(o.unit_price).toFixed(2)}
+                  </td>
+
+                  <td>
+                    {o.order_value == null
+                      ? '—'
+                      : Number(o.order_value).toFixed(2)}
+                  </td>
+
+                  <td>
+                    <span className="status-chip">
+                      {o.status}
+                    </span>
+                  </td>
+
+                  <td>
+                    {o.rejection_reason || '—'}
+                  </td>
+
+                  {isAdmin && (
+                    <td>
+                      <div className="inline-actions">
+
+                        {o.status === 'SUBMITTED' && (
+                          <>
+                            <button
+                              type="button"
+                              className="secondary"
+                              disabled={busy !== null}
+                              onClick={() => openEdit(o)}
+                            >
+                              Edit
+                            </button>
+
+                            <button
+                              type="button"
+                              className="primary"
+                              disabled={busy !== null}
+                              onClick={() => act(o, 'approve')}
+                            >
+                              Approve
+                            </button>
+
+                            <button
+                              type="button"
+                              className="secondary reject-button"
+                              disabled={busy !== null}
+                              onClick={() => openReject(o)}
+                            >
+                              Reject
+                            </button>
+                          </>
+                        )}
+
+                        {o.status === 'APPROVED' && (
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={busy !== null}
+                            onClick={() => act(o, 'invoice')}
+                          >
+                            Issue invoice
+                          </button>
+                        )}
+
+                        {![
+                          'SUBMITTED',
+                          'APPROVED'
+                        ].includes(o.status) && (
+                          <span className="muted">—</span>
+                        )}
+
+                      </div>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {isAdmin && editOrder && (
+        <form
+          className="business-form payment-form"
+          onSubmit={saveEdit}
+        >
+          <h3>Edit order #{editOrder.id}</h3>
+
+          <p className="muted">
+            {editOrder.customer_name} — {editOrder.sku}
+          </p>
+
+          <label htmlFor="edit-quantity">
+            Quantity
+          </label>
+
+          <input
+            id="edit-quantity"
+            type="number"
+            min="1"
+            step="1"
+            value={quantity}
+            onChange={e => setQuantity(e.target.value)}
+            required
+          />
+
+          <label htmlFor="edit-price">
+            Unit selling price (₹)
+          </label>
+
+          <input
+            id="edit-price"
+            type="number"
+            min="0.01"
+            step="0.01"
+            value={unitPrice}
+            onChange={e => setUnitPrice(e.target.value)}
+            required
+          />
+
+          <p>
+            Estimated taxable value:{' '}
+            <strong>
+              ₹{(
+                Number(quantity) * Number(unitPrice)
+              ).toFixed(2)}
+            </strong>
+          </p>
+
+          <div className="inline-actions">
+            <button
+              className="primary"
+              disabled={busy !== null}
+            >
+              Save changes
+            </button>
+
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy !== null}
+              onClick={() => setEditOrder(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+
+      {isAdmin && rejectOrder && (
+        <form
+          className="business-form payment-form"
+          onSubmit={saveReject}
+        >
+          <h3>Reject order #{rejectOrder.id}</h3>
+
+          <p className="muted">
+            {rejectOrder.customer_name} — {rejectOrder.sku}
+          </p>
+
+          <label htmlFor="rejection-reason">
+            Rejection reason
+          </label>
+
+          <textarea
+            id="rejection-reason"
+            rows={4}
+            minLength={3}
+            maxLength={500}
+            value={reason}
+            onChange={e => setReason(e.target.value)}
+            placeholder="Enter the reason for rejection"
+            required
+          />
+
+          <div className="inline-actions">
+            <button
+              className="secondary reject-button"
+              disabled={busy !== null}
+            >
+              Confirm rejection
+            </button>
+
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy !== null}
+              onClick={() => setRejectOrder(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+    </Panel>
+  );
 }
 
 function Invoices({

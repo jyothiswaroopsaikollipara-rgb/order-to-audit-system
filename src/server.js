@@ -73,29 +73,48 @@ app.get('/production/boms',
     res.json([...map.values()]);
   })
 );
-app.get('/orders', auth('ADMIN', 'SALESMAN', 'OWNER'), route(async (req, res) => {
-  const salesman = req.user.role === 'SALESMAN';
 
-  const result = await db.query(
-    `SELECT
-       o.id,
-       o.customer_id,
-       c.name AS customer_name,
-       o.salesman_id,
-       o.item_id,
-       i.sku,
-       o.qty,
-       o.status
-     FROM orders o
-     JOIN customers c ON c.id = o.customer_id
-     JOIN items i ON i.id = o.item_id
-     WHERE ($1::boolean = false OR o.salesman_id = $2)
-     ORDER BY o.id DESC`,
-    [salesman, req.user.id]
-  );
+app.get(
+  '/orders',
+  auth('ADMIN', 'SALESMAN', 'OWNER'),
+  route(async (req, res) => {
 
-  res.json(result.rows);
-}));
+    const salesman = req.user.role === 'SALESMAN';
+
+    const result = await db.query(
+      `SELECT
+         o.id,
+         o.customer_id,
+         c.name AS customer_name,
+         o.salesman_id,
+         o.item_id,
+         i.sku,
+         o.qty,
+         o.status,
+         o.rejection_reason,
+         o.created_at,
+         o.updated_at,
+         COALESCE(
+           o.unit_price,
+           i.selling_price
+         ) AS unit_price,
+         (
+           o.qty * COALESCE(
+             o.unit_price,
+             i.selling_price
+           )
+         )::numeric(18,2) AS order_value
+       FROM orders o
+       JOIN customers c ON c.id = o.customer_id
+       JOIN items i ON i.id = o.item_id
+       ${salesman ? 'WHERE o.salesman_id = $1' : ''}
+       ORDER BY o.id DESC`,
+      salesman ? [req.user.id] : []
+    );
+
+    res.json(result.rows);
+  })
+);
 
 app.get('/invoices',
   auth('ADMIN', 'OWNER', 'AUDITOR'),
@@ -135,7 +154,257 @@ app.post('/purchases',auth('ADMIN','PRODUCTION'),route(async(req,res)=>{const da
 app.post('/production-runs',auth('PRODUCTION','ADMIN'),route(async(req,res)=>{const data=z.object({requestKey:uuid,bomId:id,goodOutput:qty,issues:z.array(z.object({itemId:id,quantity:qty,damagedQty:z.optional(z.union([z.string(),z.number()]))})).min(1),labour:z.union([z.string(),z.number()]),energy:z.union([z.string(),z.number()])}).parse(req.body);if(D(data.labour).lt(0)||D(data.energy).lt(0))throw fail(400,'Overhead cannot be negative');const result=await tx(async c=>{const old=await query(c,'SELECT * FROM production_runs WHERE request_key=$1',[data.requestKey]);if(old.rowCount)return {run:old.rows[0],replayed:true};const bom=await query(c,'SELECT * FROM bom WHERE id=$1',[data.bomId]);if(!bom.rowCount)throw fail(404,'BOM not found');const lines=(await query(c,'SELECT * FROM bom_lines WHERE bom_id=$1',[data.bomId])).rows;const issueMap=new Map(data.issues.map(i=>[i.itemId,String(i.quantity)]));if(issueMap.size!==data.issues.length||lines.length!==data.issues.length||lines.some(l=>!issueMap.has(Number(l.item_id))))throw fail(400,'Issues must include each BOM line exactly once');let cost=D(0);const calculated=[];for(const l of lines){const issue=data.issues.find(x=>x.itemId===Number(l.item_id));const issued=D(issue.quantity);const damaged=D(issue.damagedQty??0);if(damaged.lt(0)||damaged.gt(issued))throw fail(400,'Invalid damaged quantity');const stock=await balance(c,l.item_id);if(stock.lt(issued))throw fail(409,`Insufficient stock for item ${l.item_id}`);const valuation=await query(c,`SELECT COALESCE(SUM(CASE WHEN source_type IN ('OPENING','PURCHASE') THEN delta*unit_cost ELSE 0 END),0)::text v, COALESCE(SUM(CASE WHEN source_type IN ('OPENING','PURCHASE') THEN delta ELSE 0 END),0)::text q FROM stock_movements WHERE item_id=$1`,[l.item_id]);const {v,q}=valuation.rows[0];const rate=D(q).isZero()?D(0):D(v).div(q);cost=cost.plus(issued.mul(rate));calculated.push({line:l,issued,damaged});}
 const overhead=D(data.labour).plus(data.energy);const total=cost.plus(overhead);const r=await query(c,'INSERT INTO production_runs(request_key,bom_id,good_output,expected_output,material_cost,overhead,cost_per_packet) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',[data.requestKey,data.bomId,data.goodOutput,bom.rows[0].expected_output,money(cost),money(overhead),money(total.div(data.goodOutput))]);const run=r.rows[0];for(const x of calculated){await debit(c,x.line.item_id,x.issued,'PRODUCTION_ISSUE',run.id,String(x.line.item_id),req.user.id);await query(c,'INSERT INTO production_issues(run_id,item_id,qty,damaged_qty,planned_qty,variance_pct) VALUES($1,$2,$3,$4,$5,$6)',[run.id,x.line.item_id,x.issued.toFixed(),x.damaged.toFixed(),x.line.planned_qty,variance(x.issued,x.line.planned_qty)]);}await query(c,'INSERT INTO stock_movements(item_id,delta,source_type,source_id,line_key) VALUES($1,$2,$3,$4,$5)',[bom.rows[0].finished_item_id,data.goodOutput,'PRODUCTION_OUTPUT',run.id,'good']);await audit(c,req.user.id,'PRODUCTION_RUN',run.id,'POSTED',{yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output)});return {run,yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output),replayed:false};});res.status(result.replayed?200:201).json(result);}));
 app.post('/orders',auth('SALESMAN'),route(async(req,res)=>{const d=z.object({requestKey:uuid,customerId:id,itemId:id,quantity:qty}).parse(req.body);const r=await db.query('INSERT INTO orders(request_key,customer_id,salesman_id,item_id,qty) VALUES($1,$2,$3,$4,$5) ON CONFLICT(request_key) DO UPDATE SET request_key=EXCLUDED.request_key RETURNING *',[d.requestKey,d.customerId,req.user.id,d.itemId,d.quantity]);if(String(r.rows[0].salesman_id)!==String(req.user.id))throw fail(403,'Order belongs to another salesman');res.status(201).json(r.rows[0]);}));
-app.post('/orders/:id/approve',auth('ADMIN'),route(async(req,res)=>{const result=await tx(async c=>{const r=await query(c,'SELECT * FROM orders WHERE id=$1 FOR UPDATE',[req.params.id]);if(!r.rowCount)throw fail(404,'Order not found');const o=r.rows[0];if(o.status==='APPROVED')return {status:o.status};if(o.status!=='SUBMITTED')throw fail(409,'Order cannot be approved');const stock=await balance(c,o.item_id);if(stock.lt(o.qty))throw fail(409,`Shortage: ${D(o.qty).minus(stock).toFixed()} packets`);await query(c,"UPDATE orders SET status='APPROVED' WHERE id=$1",[o.id]);await audit(c,req.user.id,'ORDER',o.id,'APPROVED');return {status:'APPROVED'};});res.json(result);}));
+
+app.post(
+  '/orders/:id/edit',
+  auth('ADMIN'),
+  route(async (req, res) => {
+
+    const d = z.object({
+      quantity: qty,
+      unitPrice: z.coerce.number()
+        .positive()
+        .max(999999999999)
+        .refine(
+          n => D(n).decimalPlaces() <= 2,
+          'Price must have at most two decimal places'
+        )
+    }).parse(req.body);
+
+    const result = await tx(async c => {
+
+      const r = await query(
+        c,
+        `SELECT o.*, i.selling_price
+         FROM orders o
+         JOIN items i ON i.id = o.item_id
+         WHERE o.id = $1
+         FOR UPDATE OF o`,
+        [req.params.id]
+      );
+
+      if (!r.rowCount) {
+        throw fail(404, 'Order not found');
+      }
+
+      const o = r.rows[0];
+
+      if (o.status !== 'SUBMITTED') {
+        throw fail(
+          409,
+          'Only submitted orders can be edited'
+        );
+      }
+
+      const updated = await query(
+        c,
+        `UPDATE orders
+         SET qty = $2,
+             unit_price = $3,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [o.id, d.quantity, d.unitPrice]
+      );
+
+      await audit(
+        c,
+        req.user.id,
+        'ORDER',
+        o.id,
+        'EDITED',
+        {
+          before: {
+            quantity: o.qty,
+            unitPrice: o.unit_price ?? o.selling_price
+          },
+          after: {
+            quantity: updated.rows[0].qty,
+            unitPrice: updated.rows[0].unit_price
+          }
+        }
+      );
+
+      return updated.rows[0];
+    });
+
+    res.json(result);
+  })
+);
+
+app.post(
+  '/orders/:id/reject',
+  auth('ADMIN'),
+  route(async (req, res) => {
+
+    const d = z.object({
+      reason: z.string().trim().min(3).max(500)
+    }).parse(req.body);
+
+    const result = await tx(async c => {
+
+      const r = await query(
+        c,
+        'SELECT * FROM orders WHERE id = $1 FOR UPDATE',
+        [req.params.id]
+      );
+
+      if (!r.rowCount) {
+        throw fail(404, 'Order not found');
+      }
+
+      const o = r.rows[0];
+
+      if (o.status === 'REJECTED') {
+        return o;
+      }
+
+      if (o.status !== 'SUBMITTED') {
+        throw fail(
+          409,
+          'Only submitted orders can be rejected'
+        );
+      }
+
+      const updated = await query(
+        c,
+        `UPDATE orders
+         SET status = 'REJECTED',
+             rejection_reason = $2,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [o.id, d.reason]
+      );
+
+      await audit(
+        c,
+        req.user.id,
+        'ORDER',
+        o.id,
+        'REJECTED',
+        { reason: d.reason }
+      );
+
+      return updated.rows[0];
+    });
+
+    res.json(result);
+  })
+);
+
+
+app.post(
+  '/orders/:id/approve',
+  auth('ADMIN'),
+  route(async (req, res) => {
+
+    const result = await tx(async c => {
+
+      const r = await query(
+        c,
+        `SELECT o.*, i.kind, i.selling_price
+         FROM orders o
+         JOIN items i ON i.id = o.item_id
+         WHERE o.id = $1
+         FOR UPDATE OF o`,
+        [req.params.id]
+      );
+
+      if (!r.rowCount) {
+        throw fail(404, 'Order not found');
+      }
+
+      const o = r.rows[0];
+
+      if (o.status === 'APPROVED') {
+        return { status: o.status };
+      }
+
+      if (o.status !== 'SUBMITTED') {
+        throw fail(409, 'Order cannot be approved');
+      }
+
+      if (o.kind !== 'FINISHED') {
+        throw fail(
+          409,
+          'Only finished products can be sold'
+        );
+      }
+
+      // Serialize stock availability checks
+      await query(
+        c,
+        'SELECT id FROM inventory_mutex WHERE id = 1 FOR UPDATE'
+      );
+
+      const stock = await balance(c, o.item_id);
+
+      const reserved = await query(
+        c,
+        `SELECT COALESCE(SUM(qty), 0)::text AS quantity
+         FROM orders
+         WHERE item_id = $1
+           AND id <> $2
+           AND status IN ('APPROVED', 'INVOICED')`,
+        [o.item_id, o.id]
+      );
+
+      const available = stock.minus(
+        reserved.rows[0].quantity
+      );
+
+      if (available.lt(o.qty)) {
+        throw fail(
+          409,
+          `Shortage: ${D(o.qty).minus(
+            D.max ? D.max(available, 0) :
+              (available.lt(0) ? D(0) : available)
+          ).toFixed()} packets`
+        );
+      }
+
+      const approvedPrice =
+        o.unit_price ?? o.selling_price;
+
+      if (
+        approvedPrice == null ||
+        !D(approvedPrice).gt(0)
+      ) {
+        throw fail(409, 'Invalid selling price');
+      }
+
+      await query(
+        c,
+        `UPDATE orders
+         SET status = 'APPROVED',
+             unit_price = $2,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [o.id, approvedPrice]
+      );
+
+      await audit(
+        c,
+        req.user.id,
+        'ORDER',
+        o.id,
+        'APPROVED',
+        {
+          quantity: o.qty,
+          unitPrice: approvedPrice,
+          physicalStock: stock.toFixed(),
+          reservedStock: reserved.rows[0].quantity,
+          availableStock: available.toFixed()
+        }
+      );
+
+      return { status: 'APPROVED' };
+    });
+
+    res.json(result);
+  })
+);
 
 
 app.post(
@@ -150,7 +419,7 @@ app.post(
         c,
         `SELECT
           o.*,
-          i.selling_price,
+          COALESCE(o.unit_price, i.selling_price) AS selling_price,
           i.gst_rate,
           i.sku,
           i.name AS product_name,

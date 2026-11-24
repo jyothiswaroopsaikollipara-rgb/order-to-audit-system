@@ -25,3 +25,20 @@
   font-weight: 700;
   background: #fffbeb;
 }
+.reject-button {
+  color: #dc2626;
+  border-color: #dc2626;
+}
+
+.reject-button:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.08);
+}
+
+.business-form textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font: inherit;
+  resize: vertical;
+}
