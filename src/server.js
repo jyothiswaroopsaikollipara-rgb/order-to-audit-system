@@ -5,6 +5,8 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import {z} from 'zod';
 import {D,money,variance,tax} from './math.js';
+import { registerReports } from './reports.js';
+
 if(!process.env.JWT_SECRET || process.env.JWT_SECRET.length<32 || !process.env.DATABASE_URL) throw Error('DATABASE_URL and JWT_SECRET (32+ characters) required');
 const db=new pg.Pool({connectionString:process.env.DATABASE_URL});
 const app=express();app.disable('x-powered-by');app.use(express.json({limit:'32kb'}));
@@ -155,5 +157,6 @@ app.get(
     res.json(result.rows);
   })
 );
+registerReports(app, db, auth, route);
 app.use((err,req,res,next)=>{const status=err instanceof z.ZodError?400:(err.status||((err.code==='23505'||err.code==='23503')?409:500));if(status===500)console.error('Request failed',err);res.status(status).json({error:status===500?'Internal server error':err instanceof z.ZodError?'Invalid input':err.message});});
 const port=Number(process.env.PORT||3000);app.listen(port,()=>console.log(`API listening on ${port}`));
