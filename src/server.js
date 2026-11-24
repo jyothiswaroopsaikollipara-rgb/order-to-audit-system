@@ -30,10 +30,96 @@ const route = (handler) => (req, res, next) =>
     .catch(next);
 const auth=(...roles)=>route(async(req,res,next)=>{const token=(req.headers.authorization||'').match(/^Bearer (.+)$/)?.[1];if(!token)throw fail(401,'Authentication required');let data;try{data=jwt.verify(token,process.env.JWT_SECRET,{algorithms:['HS256']});}catch{throw fail(401,'Invalid or expired token');}const r=await db.query('SELECT id,role FROM users WHERE id=$1',[data.sub]);if(!r.rowCount)throw fail(401,'Unknown user');req.user=r.rows[0];if(roles.length&&!roles.includes(req.user.role))throw fail(403,'Role not permitted');next();});
 app.get('/health',route(async(req,res)=>{await db.query('SELECT 1');res.json({status:'ok'});}));
-app.post('/auth/login',route(async(req,res)=>{const {email,password}=z.object({email:z.string().email(),password:z.string()}).parse(req.body);const r=await db.query('SELECT * FROM users WHERE email=$1',[email]);if(!r.rowCount||!await bcrypt.compare(password,r.rows[0].password_hash))throw fail(401,'Invalid credentials');const u=r.rows[0];res.json({token:jwt.sign({sub:String(u.id),role:u.role},process.env.JWT_SECRET,{algorithm:'HS256',expiresIn:'4h'}),role:u.role});}));
+
+app.post('/auth/login', route(async (req, res) => {
+  const { email, password } = z.object({
+    email: z.string().email(),
+    password: z.string()
+  }).parse(req.body);
+
+  const r = await db.query(
+    'SELECT * FROM users WHERE email = $1',
+    [email]
+  );
+
+  if (
+    !r.rowCount ||
+    !await bcrypt.compare(password, r.rows[0].password_hash)
+  ) {
+    throw fail(401, 'Invalid credentials');
+  }
+
+  const u = r.rows[0];
+
+  res.json({
+    token: jwt.sign(
+      {
+        sub: String(u.id),
+        role: u.role
+      },
+      process.env.JWT_SECRET,
+      {
+        algorithm: 'HS256',
+        expiresIn: '4h'
+      }
+    ),
+    role: u.role,
+    userId: String(u.id)
+  });
+}));
+
 app.get('/stock',auth('ADMIN','PRODUCTION','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT * FROM stock_balances ORDER BY item_id')).rows)));
 app.get('/stock/ledger',auth('ADMIN','PRODUCTION','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT m.*,i.sku FROM stock_movements m JOIN items i ON i.id=m.item_id ORDER BY m.id')).rows)));
-app.get('/masters',auth('ADMIN','PRODUCTION','SALESMAN','OWNER'),route(async(req,res)=>{const [items,customers,boms]=await Promise.all([db.query('SELECT * FROM items ORDER BY id'),db.query('SELECT * FROM customers ORDER BY id'),db.query('SELECT * FROM bom')]);res.json({items:items.rows,customers:customers.rows,boms:boms.rows});}));
+
+app.get(
+  '/masters',
+  auth('ADMIN', 'PRODUCTION', 'SALESMAN', 'OWNER'),
+  route(async (req, res) => {
+
+    if (req.user.role === 'SALESMAN') {
+      const [items, customers] = await Promise.all([
+        db.query(`
+          SELECT
+            id,
+            sku,
+            name,
+            kind,
+            unit,
+            selling_price,
+            gst_rate,
+            units_per_carton
+          FROM items
+          WHERE kind = 'FINISHED'
+          ORDER BY name
+        `),
+
+        db.query(`
+          SELECT id, name, state_code
+          FROM customers
+          ORDER BY name
+        `)
+      ]);
+
+      return res.json({
+        items: items.rows,
+        customers: customers.rows,
+        boms: []
+      });
+    }
+
+    const [items, customers, boms] = await Promise.all([
+      db.query('SELECT * FROM items ORDER BY id'),
+      db.query('SELECT * FROM customers ORDER BY id'),
+      db.query('SELECT * FROM bom')
+    ]);
+
+    res.json({
+      items: items.rows,
+      customers: customers.rows,
+      boms: boms.rows
+    });
+  })
+);
 
 app.post(
   '/masters/items/:id/carton-ratio',
@@ -876,7 +962,205 @@ app.post(
 );
 
 //const overhead=D(data.labour).plus(data.energy);const total=cost.plus(overhead);const r=await query(c,'INSERT INTO production_runs(request_key,bom_id,good_output,expected_output,material_cost,overhead,cost_per_packet) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',[data.requestKey,data.bomId,data.goodOutput,bom.rows[0].expected_output,money(cost),money(overhead),money(total.div(data.goodOutput))]);const run=r.rows[0];for(const x of calculated){await debit(c,x.line.item_id,x.issued,'PRODUCTION_ISSUE',run.id,String(x.line.item_id),req.user.id);await query(c,'INSERT INTO production_issues(run_id,item_id,qty,damaged_qty,planned_qty,variance_pct) VALUES($1,$2,$3,$4,$5,$6)',[run.id,x.line.item_id,x.issued.toFixed(),x.damaged.toFixed(),x.line.planned_qty,variance(x.issued,x.line.planned_qty)]);}await query(c,'INSERT INTO stock_movements(item_id,delta,source_type,source_id,line_key) VALUES($1,$2,$3,$4,$5)',[bom.rows[0].finished_item_id,data.goodOutput,'PRODUCTION_OUTPUT',run.id,'good']);await audit(c,req.user.id,'PRODUCTION_RUN',run.id,'POSTED',{yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output)});return {run,yieldVariancePct:variance(data.goodOutput,bom.rows[0].expected_output),replayed:false};});res.status(result.replayed?200:201).json(result);}));
-app.post('/orders',auth('SALESMAN'),route(async(req,res)=>{const d=z.object({requestKey:uuid,customerId:id,itemId:id,quantity:qty}).parse(req.body);const r=await db.query('INSERT INTO orders(request_key,customer_id,salesman_id,item_id,qty) VALUES($1,$2,$3,$4,$5) ON CONFLICT(request_key) DO UPDATE SET request_key=EXCLUDED.request_key RETURNING *',[d.requestKey,d.customerId,req.user.id,d.itemId,d.quantity]);if(String(r.rows[0].salesman_id)!==String(req.user.id))throw fail(403,'Order belongs to another salesman');res.status(201).json(r.rows[0]);}));
+
+app.post(
+  '/orders',
+  auth('SALESMAN'),
+  route(async (req, res) => {
+
+    const d = z.object({
+      requestKey: uuid,
+      customerId: id,
+      itemId: id,
+      quantity: qty
+    }).parse(req.body);
+
+    const quantity = D(d.quantity);
+
+    if (
+      !quantity.isFinite() ||
+      quantity.lte(0) ||
+      quantity.decimalPlaces() > 4 ||
+      quantity.gt('99999999999999.9999')
+    ) {
+      throw fail(400, 'Invalid order quantity');
+    }
+
+    const payload = {
+      customerId: String(d.customerId),
+      itemId: String(d.itemId),
+      quantity: quantity.toFixed()
+    };
+
+    const result = await tx(async c => {
+
+      // Serialize order submission retries.
+      await query(
+        c,
+        'SELECT id FROM inventory_mutex WHERE id = 1 FOR UPDATE'
+      );
+
+      const existing = await query(
+        c,
+        `SELECT *
+         FROM orders
+         WHERE request_key = $1`,
+        [d.requestKey]
+      );
+
+      if (existing.rowCount) {
+        const order = existing.rows[0];
+
+        if (
+          String(order.salesman_id) !==
+          String(req.user.id)
+        ) {
+          throw fail(403, 'Order belongs to another salesman');
+        }
+
+        const original = order.submission_payload;
+
+        if (original) {
+          if (
+            String(original.customerId) !== payload.customerId ||
+            String(original.itemId) !== payload.itemId ||
+            !D(original.quantity).eq(quantity)
+          ) {
+            throw fail(
+              409,
+              'Request ID already used for a different order'
+            );
+          }
+        } else {
+          // Legacy orders created before migration 006.
+          if (
+            String(order.customer_id) !== payload.customerId ||
+            String(order.item_id) !== payload.itemId ||
+            !D(order.qty).eq(quantity)
+          ) {
+            throw fail(
+              409,
+              'Legacy request does not match the existing order'
+            );
+          }
+        }
+
+        return {
+          order,
+          replayed: true
+        };
+      }
+
+      const customer = await query(
+        c,
+        'SELECT id FROM customers WHERE id = $1',
+        [d.customerId]
+      );
+
+      if (!customer.rowCount) {
+        throw fail(404, 'Customer not found');
+      }
+
+      const itemResult = await query(
+        c,
+        `SELECT id, kind, unit, selling_price
+         FROM items
+         WHERE id = $1`,
+        [d.itemId]
+      );
+
+      if (!itemResult.rowCount) {
+        throw fail(404, 'Product not found');
+      }
+
+      const item = itemResult.rows[0];
+
+      if (item.kind !== 'FINISHED') {
+        throw fail(
+          400,
+          'Only finished products can be ordered'
+        );
+      }
+
+      if (
+        item.selling_price == null ||
+        D(item.selling_price).lte(0)
+      ) {
+        throw fail(
+          400,
+          'Product selling price is not configured'
+        );
+      }
+
+      const discreteUnits = [
+        'piece', 'pieces',
+        'packet', 'packets',
+        'carton', 'cartons',
+        'pcs'
+      ];
+
+      if (
+        discreteUnits.includes(
+          String(item.unit).toLowerCase()
+        ) &&
+        !quantity.isInteger()
+      ) {
+        throw fail(
+          400,
+          'This product requires a whole-number quantity'
+        );
+      }
+
+      const inserted = await query(
+        c,
+        `INSERT INTO orders (
+          request_key,
+          customer_id,
+          salesman_id,
+          item_id,
+          qty,
+          submission_payload
+        )
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+        RETURNING *`,
+        [
+          d.requestKey,
+          d.customerId,
+          req.user.id,
+          d.itemId,
+          quantity.toFixed(),
+          JSON.stringify(payload)
+        ]
+      );
+
+      const order = inserted.rows[0];
+
+      await audit(
+        c,
+        req.user.id,
+        'ORDER',
+        order.id,
+        'SUBMITTED',
+        {
+          requestKey: d.requestKey,
+          customerId: payload.customerId,
+          itemId: payload.itemId,
+          quantity: payload.quantity
+        }
+      );
+
+      return {
+        order,
+        replayed: false
+      };
+    });
+
+    res.status(result.replayed ? 200 : 201).json({
+      ...result.order,
+      replayed: result.replayed
+    });
+  })
+);
 
 app.post(
   '/orders/:id/edit',

@@ -5,9 +5,14 @@ import { LayoutDashboard, LogOut, Package, Receipt, ShieldCheck, Factory, Shoppi
 import './App.css';
 import ReportsCentre from './ReportsCentre';
 import BusinessDashboard from './BusinessDashboard';
+import MobileOrderEntry from './MobileOrderEntry';
 
 type Role = 'ADMIN' | 'SALESMAN' | 'PRODUCTION' | 'AUDITOR' | 'OWNER';
-type Session = { token: string; role: Role };
+type Session = {
+  token: string;
+  role: Role;
+  userId: string;
+};
 type Order = {
   id: number;
   customer_id: number;
@@ -32,6 +37,8 @@ type MasterItem = {
   kind: string;
   unit: string;
   units_per_carton: string | null;
+  selling_price: string | null;
+  gst_rate: string | null;
 };
 
 type Masters = {
@@ -141,8 +148,33 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
       const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });
       if (!response.ok) throw new Error(response.status === 401 ? 'Invalid email or password.' : `Login failed (${response.status}).`);
       const data: unknown = await response.json();
+
+if (
+  !data ||
+  typeof data !== 'object' ||
+  !('token' in data) ||
+  !('role' in data) ||
+  !('userId' in data) ||
+  typeof data.token !== 'string' ||
+  typeof data.userId !== 'string' ||
+  !/^\d+$/.test(data.userId) ||
+  !allRoles.includes(data.role as Role)
+) {
+  throw new Error('Unexpected login response.');
+}
+
+onLogin({
+  token: data.token,
+  role: data.role as Role,
+  userId: data.userId
+});
+
+navigate('/dashboard', { replace: true });
       if (!data || typeof data !== 'object' || !('token' in data) || !('role' in data) || typeof data.token !== 'string' || !allRoles.includes(data.role as Role)) throw new Error('Unexpected login response.');
-      onLogin({ token: data.token, role: data.role as Role }); navigate('/dashboard', { replace: true });
+      onLogin({
+        token: data.token, role: data.role as Role,
+        userId: ''
+      }); navigate('/dashboard', { replace: true });
     } catch (e) { setError(messageOf(e)); } finally { setLoading(false); }
   }
   return <main className="login-screen"><section className="login-card"><div className="brand-mark"><ShieldCheck size={27}/></div><p className="eyebrow">OPERATIONS PLATFORM</p><h1>Order to Audit</h1><p className="muted">Secure access to orders, production, inventory and finance.</p><form onSubmit={submit}><label htmlFor="email">Work email</label><input id="email" type="email" autoComplete="username" value={email} onChange={e=>setEmail(e.target.value)} required placeholder="you@company.com"/><label htmlFor="password">Password</label><input id="password" type="password" autoComplete="current-password" value={password} onChange={e=>setPassword(e.target.value)} required placeholder="Enter your password"/>{error && <p className="error" role="alert">{error}</p>}<button className="primary" disabled={loading}>{loading ? 'Signing in…' : 'Sign in'}</button></form><p className="fineprint">Access is limited to authorized personnel.</p></section></main>;
@@ -166,23 +198,21 @@ function DataPage({ title, path, session, onUnauthorized }: { title: string; pat
   const keys = data?.length ? Object.keys(data[0]) : [];
   return <Panel title={title} onRefresh={refresh}>{loading ? <p className="muted">Loading…</p> : error ? <Alert error={error}/> : !data?.length ? <p className="muted">No records found.</p> : <div className="table-wrap"><table><thead><tr>{keys.map(k=><th key={k}>{k.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{data.map((r,i)=><tr key={i}>{keys.map(k=><td key={k}>{String(r[k] ?? '—')}</td>)}</tr>)}</tbody></table></div>}</Panel>;
 }
-function CreateOrder({ session, onUnauthorized }: { session: Session; onUnauthorized: () => void }) {
-  const { data: masters, error: masterError, loading } = useRemote<Masters>('/masters', session, onUnauthorized);
-  const [customerId, setCustomerId] = useState(''); const [itemId, setItemId] = useState(''); const [quantity, setQuantity] = useState('');
-  const [pending, setPending] = useState(false); const [error, setError] = useState(''); const [success, setSuccess] = useState('');
-  const [requestKey, setRequestKey] = useState(() => crypto.randomUUID());
-  const products = masters?.items.filter(item => item.kind === 'FINISHED') ?? [];
-  async function submit(event: FormEvent) {
-    event.preventDefault(); setError(''); setSuccess('');
-    if (!customerId || !itemId || !isPositive(quantity)) { setError('Select a customer and finished product, and enter a positive quantity.'); return; }
-    setPending(true);
-    try {
-      const order = await api<{ id: number; status: string }>('/orders', session.token, 'POST', { requestKey, customerId: Number(customerId), itemId: Number(itemId), quantity });
-      setSuccess(`Order #${order.id} submitted (${order.status}). Admin approval is required.`); setQuantity(''); setRequestKey(crypto.randomUUID());
-    } catch (e) { const msg = messageOf(e); setError(msg); if (msg.includes('Session expired')) onUnauthorized(); }
-    finally { setPending(false); }
-  }
-  return <Panel title="Create sales order"><p className="muted">Submit an order for admin review. Stock is checked when the admin approves it.</p><Alert error={masterError || error} success={success}/>{loading ? <p className="muted">Loading customers and products…</p> : <form className="business-form" onSubmit={submit}><label htmlFor="customer">Customer</label><select id="customer" required value={customerId} onChange={e=>setCustomerId(e.target.value)}><option value="">Select customer</option>{masters?.customers.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select><label htmlFor="product">Finished product</label><select id="product" required value={itemId} onChange={e=>setItemId(e.target.value)}><option value="">Select product</option>{products.map(p=><option key={p.id} value={p.id}>{p.sku}</option>)}</select><label htmlFor="quantity">Quantity (packets)</label><input id="quantity" type="number" min="0.0001" step="any" required value={quantity} onChange={e=>setQuantity(e.target.value)} placeholder="e.g. 120"/><button className="primary" disabled={pending || !masters?.customers.length || !products.length}>{pending ? 'Submitting…' : 'Submit order'}</button></form>}</Panel>;
+function CreateOrder({
+  session,
+  onUnauthorized
+}: {
+  session: Session;
+  onUnauthorized: () => void;
+}) {
+  return (
+    <MobileOrderEntry
+      key={session.userId}
+      token={session.token}
+      userId={session.userId}
+      onUnauthorized={onUnauthorized}
+    />
+  );
 }
 
 function Orders({
