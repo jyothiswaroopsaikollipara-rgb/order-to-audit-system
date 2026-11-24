@@ -115,31 +115,361 @@ function Orders({ session, onUnauthorized }: { session: Session; onUnauthorized:
   }
   return <Panel title={session.role === 'SALESMAN' ? 'My orders' : 'Sales orders'} onRefresh={refresh}><Alert error={loadError || error} success={success}/>{loading ? <p className="muted">Loading orders…</p> : !data?.length ? <p className="muted">No orders found.</p> : <div className="table-wrap"><table><thead><tr><th>ID</th><th>Customer</th><th>Product</th><th>Quantity</th><th>Status</th>{session.role === 'ADMIN' && <th>Actions</th>}</tr></thead><tbody>{data.map(o=><tr key={o.id}><td>#{o.id}</td><td>{o.customer_name}</td><td>{o.sku}</td><td>{o.qty}</td><td><span className="status-chip">{o.status}</span></td>{session.role === 'ADMIN' && <td><div className="inline-actions">{o.status === 'SUBMITTED' && <button className="secondary" disabled={busy !== null} onClick={()=>act(o,'approve')}>Approve</button>}{o.status === 'APPROVED' && <button className="secondary" disabled={busy !== null} onClick={()=>act(o,'invoice')}>Issue invoice</button>}{!['SUBMITTED','APPROVED'].includes(o.status) && <span className="muted">—</span>}</div></td>}</tr>)}</tbody></table></div>}</Panel>;
 }
-function Invoices({ session, onUnauthorized }: { session: Session; onUnauthorized: () => void }) {
-  const { data, error: loadError, loading, refresh } = useRemote<InvoiceV2[]>('/invoices', session, onUnauthorized);
-  const [busy, setBusy] = useState<number | null>(null); const [error, setError] = useState(''); const [success, setSuccess] = useState('');
-  const [payId, setPayId] = useState<number | null>(null); const [reference, setReference] = useState(''); const [amount, setAmount] = useState('');
-  const [paymentKey, setPaymentKey] = useState(() => crypto.randomUUID());
+
+function Invoices({
+  session,
+  onUnauthorized
+}: {
+  session: Session;
+  onUnauthorized: () => void;
+}) {
+  const {
+    data,
+    error: loadError,
+    loading,
+    refresh
+  } = useRemote<InvoiceV2[]>(
+    '/invoices',
+    session,
+    onUnauthorized
+  );
+
+  const [busy, setBusy] = useState<number | null>(null);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  const [payId, setPayId] = useState<number | null>(null);
+  const [reference, setReference] = useState('');
+  const [amount, setAmount] = useState('');
+
+  const [paymentKey, setPaymentKey] = useState(
+    () => crypto.randomUUID()
+  );
+
+  const [pdfBusy, setPdfBusy] = useState<number | null>(null);
+
+  // Download invoice PDF
+  async function downloadPdf(inv: InvoiceV2) {
+    setPdfBusy(inv.id);
+    setError('');
+    setSuccess('');
+
+    try {
+      const response = await fetch(
+        `/api/invoices/${inv.id}/pdf`,
+        {
+          headers: {
+            Authorization: `Bearer ${session.token}`
+          }
+        }
+      );
+
+      if (response.status === 401) {
+        onUnauthorized();
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          `PDF download failed (${response.status})`
+        );
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+
+      const link = document.createElement('a');
+
+      link.href = url;
+      link.download =
+        `${inv.invoice_no.replace(/[^a-zA-Z0-9_-]/g, '_')}.pdf`;
+
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      window.setTimeout(
+        () => URL.revokeObjectURL(url),
+        1000
+      );
+
+      setSuccess(`PDF downloaded for ${inv.invoice_no}.`);
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setPdfBusy(null);
+    }
+  }
+
+  // Dispatch invoice
   async function dispatch(inv: InvoiceV2) {
-    if (inv.dispatched || inv.order_status !== 'INVOICED') return;
-    if (!window.confirm(`Dispatch invoice ${inv.invoice_no}? This will reduce finished-goods stock.`)) return;
-    setBusy(inv.id); setError(''); setSuccess('');
-    try { await api<unknown>(`/invoices/${inv.id}/dispatch`, session.token, 'POST'); setSuccess(`Dispatch posted for ${inv.invoice_no}.`); refresh(); }
-    catch (e) { const msg = messageOf(e); setError(msg); if (msg.includes('Session expired')) onUnauthorized(); }
-    finally { setBusy(null); }
+    if (
+      inv.dispatched ||
+      inv.order_status !== 'INVOICED'
+    ) return;
+
+    if (
+      !window.confirm(
+        `Dispatch invoice ${inv.invoice_no}? This will reduce finished-goods stock.`
+      )
+    ) return;
+
+    setBusy(inv.id);
+    setError('');
+    setSuccess('');
+
+    try {
+      await api<unknown>(
+        `/invoices/${inv.id}/dispatch`,
+        session.token,
+        'POST'
+      );
+
+      setSuccess(
+        `Dispatch posted for ${inv.invoice_no}.`
+      );
+
+      refresh();
+    } catch (e) {
+      const msg = messageOf(e);
+      setError(msg);
+
+      if (msg.includes('Session expired')) {
+        onUnauthorized();
+      }
+    } finally {
+      setBusy(null);
+    }
   }
+
+  // Record payment
   async function pay(event: FormEvent) {
-    event.preventDefault(); if (payId === null) return;
-    setError(''); setSuccess('');
+    event.preventDefault();
+
+    if (payId === null) return;
+
+    setError('');
+    setSuccess('');
+
     const inv = data?.find(x => x.id === payId);
-    if (!inv || !isPositive(amount) || Number(amount) > Number(inv.outstanding)) { setError('Enter a positive amount no greater than the outstanding balance.'); return; }
+
+    if (
+      !inv ||
+      !isPositive(amount) ||
+      Number(amount) > Number(inv.outstanding)
+    ) {
+      setError(
+        'Enter a positive amount no greater than the outstanding balance.'
+      );
+      return;
+    }
+
     setBusy(payId);
-    try { await api<unknown>(`/invoices/${payId}/payments`, session.token, 'POST', { reference: reference.trim() || `UI-PAY-${paymentKey}`, amount }); setSuccess(`Payment recorded for ${inv.invoice_no}.`); setPayId(null); setAmount(''); setReference(''); setPaymentKey(crypto.randomUUID()); refresh(); }
-    catch (e) { const msg = messageOf(e); setError(msg); if (msg.includes('Session expired')) onUnauthorized(); }
-    finally { setBusy(null); }
+
+    try {
+      await api<unknown>(
+        `/invoices/${payId}/payments`,
+        session.token,
+        'POST',
+        {
+          reference:
+            reference.trim() || `UI-PAY-${paymentKey}`,
+          amount
+        }
+      );
+
+      setSuccess(
+        `Payment recorded for ${inv.invoice_no}.`
+      );
+
+      setPayId(null);
+      setAmount('');
+      setReference('');
+      setPaymentKey(crypto.randomUUID());
+
+      refresh();
+    } catch (e) {
+      const msg = messageOf(e);
+      setError(msg);
+
+      if (msg.includes('Session expired')) {
+        onUnauthorized();
+      }
+    } finally {
+      setBusy(null);
+    }
   }
-  return <Panel title="GST invoices" onRefresh={refresh}><Alert error={loadError || error} success={success}/>{loading ? <p className="muted">Loading invoices…</p> : !data?.length ? <p className="muted">No invoices found.</p> : <div className="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Taxable</th><th>CGST</th><th>SGST</th><th>IGST</th><th>Total</th><th>Paid</th><th>Outstanding</th><th>Dispatch status</th>{session.role === 'ADMIN' && <th>Actions</th>}</tr></thead><tbody>{data.map(inv=><tr key={inv.id}><td>{inv.invoice_no}</td><td>{inv.customer_name}</td><td>{inv.taxable}</td><td>{inv.cgst}</td><td>{inv.sgst}</td><td>{inv.igst}</td><td>{inv.total}</td><td>{inv.paid}</td><td>{inv.outstanding}</td><td><span className="status-chip">{inv.dispatched ? 'DISPATCHED' : inv.order_status === 'INVOICED' ? 'PENDING' : inv.order_status}</span></td>{session.role === 'ADMIN' && <td><div className="inline-actions">{!inv.dispatched && inv.order_status === 'INVOICED' && <button className="secondary" disabled={busy !== null} onClick={()=>dispatch(inv)}>Dispatch</button>}{Number(inv.outstanding) > 0 && <button className="secondary" disabled={busy !== null} onClick={()=>{setPayId(inv.id);setAmount('');setReference('');setError('');}}>Record payment</button>}</div></td>}</tr>)}</tbody></table></div>}{session.role === 'ADMIN' && payId !== null && <form className="business-form payment-form" onSubmit={pay}><h3>Record payment — {data?.find(x=>x.id===payId)?.invoice_no}</h3><p className="muted">Outstanding: {data?.find(x=>x.id===payId)?.outstanding}</p><label htmlFor="payref">Payment reference (optional)</label><input id="payref" value={reference} onChange={e=>setReference(e.target.value)} placeholder="Bank reference or auto-generated"/><label htmlFor="payamount">Amount (₹)</label><input id="payamount" type="number" min="0.01" step="0.01" value={amount} onChange={e=>setAmount(e.target.value)} required/><div className="inline-actions"><button className="primary" disabled={busy !== null}>Save payment</button><button className="secondary" type="button" onClick={()=>setPayId(null)}>Cancel</button></div></form>}</Panel>;
+
+  return (
+    <Panel title="GST invoices" onRefresh={refresh}>
+      <Alert
+        error={loadError || error}
+        success={success}
+      />
+
+      {loading ? (
+        <p className="muted">Loading invoices…</p>
+      ) : !data?.length ? (
+        <p className="muted">No invoices found.</p>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Invoice</th>
+                <th>Customer</th>
+                <th>Taxable</th>
+                <th>CGST</th>
+                <th>SGST</th>
+                <th>IGST</th>
+                <th>Total</th>
+                <th>Paid</th>
+                <th>Outstanding</th>
+                <th>Dispatch status</th>
+                <th>Invoice PDF</th>
+
+                {session.role === 'ADMIN' && (
+                  <th>Actions</th>
+                )}
+              </tr>
+            </thead>
+
+            <tbody>
+              {data.map(inv => (
+                <tr key={inv.id}>
+                  <td>{inv.invoice_no}</td>
+                  <td>{inv.customer_name}</td>
+                  <td>{inv.taxable}</td>
+                  <td>{inv.cgst}</td>
+                  <td>{inv.sgst}</td>
+                  <td>{inv.igst}</td>
+                  <td>{inv.total}</td>
+                  <td>{inv.paid}</td>
+                  <td>{inv.outstanding}</td>
+
+                  <td>
+                    <span className="status-chip">
+                      {inv.dispatched
+                        ? 'DISPATCHED'
+                        : inv.order_status === 'INVOICED'
+                          ? 'PENDING'
+                          : inv.order_status}
+                    </span>
+                  </td>
+
+                  <td>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={pdfBusy !== null}
+                      onClick={() => downloadPdf(inv)}
+                    >
+                      {pdfBusy === inv.id
+                        ? 'Downloading…'
+                        : 'Download PDF'}
+                    </button>
+                  </td>
+
+                  {session.role === 'ADMIN' && (
+                    <td>
+                      <div className="inline-actions">
+                        {!inv.dispatched &&
+                          inv.order_status === 'INVOICED' && (
+                            <button
+                              className="secondary"
+                              disabled={busy !== null}
+                              onClick={() => dispatch(inv)}
+                            >
+                              Dispatch
+                            </button>
+                          )}
+
+                        {Number(inv.outstanding) > 0 && (
+                          <button
+                            className="secondary"
+                            disabled={busy !== null}
+                            onClick={() => {
+                              setPayId(inv.id);
+                              setAmount('');
+                              setReference('');
+                              setError('');
+                            }}
+                          >
+                            Record payment
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {session.role === 'ADMIN' && payId !== null && (
+        <form
+          className="business-form payment-form"
+          onSubmit={pay}
+        >
+          <h3>
+            Record payment —{' '}
+            {data?.find(x => x.id === payId)?.invoice_no}
+          </h3>
+
+          <p className="muted">
+            Outstanding:{' '}
+            {data?.find(x => x.id === payId)?.outstanding}
+          </p>
+
+          <label htmlFor="payref">
+            Payment reference (optional)
+          </label>
+
+          <input
+            id="payref"
+            value={reference}
+            onChange={e => setReference(e.target.value)}
+            placeholder="Bank reference or auto-generated"
+          />
+
+          <label htmlFor="payamount">
+            Amount (₹)
+          </label>
+
+          <input
+            id="payamount"
+            type="number"
+            min="0.01"
+            step="0.01"
+            value={amount}
+            onChange={e => setAmount(e.target.value)}
+            required
+          />
+
+          <div className="inline-actions">
+            <button
+              className="primary"
+              disabled={busy !== null}
+            >
+              Save payment
+            </button>
+
+            <button
+              className="secondary"
+              type="button"
+              onClick={() => setPayId(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+    </Panel>
+  );
 }
+
 
 function PurchaseEntry({ session, onUnauthorized }: { session: Session; onUnauthorized: () => void }) {
   const { data: masters, loading, error: loadError } = useRemote<Masters>('/masters', session, onUnauthorized);
