@@ -42,3 +42,63 @@
   font: inherit;
   resize: vertical;
 }
+
+.variance-alert {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.variance-normal {
+  color: #16a34a;
+  font-weight: 600;
+}
+
+.production-metrics {
+  display: grid;
+  grid-template-columns:
+    repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.production-metrics > div {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid rgba(128, 128, 128, 0.25);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.production-metrics span {
+  font-size: 13px;
+}
+
+.production-metrics strong {
+  font-size: 20px;
+}
+
+.tolerance-form {
+  margin: 16px 0 24px;
+}
+
+.production-form fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.production-form table input,
+.production-form table select {
+  min-width: 90px;
+}
+
+.production-report-run {
+  margin-top: 24px;
+  padding-bottom: 24px;
+  border-bottom:
+    1px solid rgba(128, 128, 128, 0.25);
+}
