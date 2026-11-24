@@ -26,6 +26,46 @@ app.post('/auth/login',route(async(req,res)=>{const {email,password}=z.object({e
 app.get('/stock',auth('ADMIN','PRODUCTION','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT * FROM stock_balances ORDER BY item_id')).rows)));
 app.get('/stock/ledger',auth('ADMIN','PRODUCTION','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT m.*,i.sku FROM stock_movements m JOIN items i ON i.id=m.item_id ORDER BY m.id')).rows)));
 app.get('/masters',auth('ADMIN','PRODUCTION','SALESMAN','OWNER'),route(async(req,res)=>{const [items,customers,boms]=await Promise.all([db.query('SELECT * FROM items ORDER BY id'),db.query('SELECT * FROM customers ORDER BY id'),db.query('SELECT * FROM bom')]);res.json({items:items.rows,customers:customers.rows,boms:boms.rows});}));
+app.get('/production/boms',
+  auth('ADMIN', 'PRODUCTION'),
+  route(async (req, res) => {
+    const result = await db.query(`
+      SELECT
+        b.id,
+        b.expected_output,
+        finished.sku AS finished_product,
+        l.item_id,
+        l.planned_qty,
+        material.sku AS material_sku
+      FROM bom b
+      JOIN items finished ON finished.id = b.finished_item_id
+      JOIN bom_lines l ON l.bom_id = b.id
+      JOIN items material ON material.id = l.item_id
+      ORDER BY b.id, l.item_id
+    `);
+
+    const map = new Map();
+
+    for (const r of result.rows) {
+      if (!map.has(r.id)) {
+        map.set(r.id, {
+          id: r.id,
+          expected_output: r.expected_output,
+          finished_product: r.finished_product,
+          lines: []
+        });
+      }
+
+      map.get(r.id).lines.push({
+        item_id: r.item_id,
+        planned_qty: r.planned_qty,
+        sku: r.material_sku
+      });
+    }
+
+    res.json([...map.values()]);
+  })
+);
 app.get('/orders', auth('ADMIN', 'SALESMAN', 'OWNER'), route(async (req, res) => {
   const salesman = req.user.role === 'SALESMAN';
 
@@ -50,30 +90,39 @@ app.get('/orders', auth('ADMIN', 'SALESMAN', 'OWNER'), route(async (req, res) =>
   res.json(result.rows);
 }));
 
-app.get('/invoices', auth('ADMIN', 'OWNER', 'AUDITOR'), route(async (req, res) => {
-  const result = await db.query(
-    `SELECT
-       i.id,
-       i.invoice_no,
-       i.order_id,
-       c.name AS customer_name,
-       i.taxable,
-       i.cgst,
-       i.sgst,
-       i.igst,
-       i.total,
-       COALESCE(SUM(p.amount), 0)::numeric(18,2) AS paid,
-       (i.total - COALESCE(SUM(p.amount), 0))::numeric(18,2) AS outstanding
-     FROM invoices i
-     JOIN orders o ON o.id = i.order_id
-     JOIN customers c ON c.id = o.customer_id
-     LEFT JOIN payments p ON p.invoice_id = i.id
-     GROUP BY i.id, c.name
-     ORDER BY i.id DESC`
-  );
+app.get('/invoices',
+  auth('ADMIN', 'OWNER', 'AUDITOR'),
+  route(async (req, res) => {
+    const result = await db.query(`
+      SELECT
+        i.id,
+        i.invoice_no,
+        i.order_id,
+        c.name AS customer_name,
+        i.taxable,
+        i.cgst,
+        i.sgst,
+        i.igst,
+        i.total,
+        COALESCE(SUM(p.amount), 0)::numeric(18,2) AS paid,
+        (i.total - COALESCE(SUM(p.amount), 0))
+          ::numeric(18,2) AS outstanding,
+        o.status AS order_status,
+        EXISTS (
+          SELECT 1 FROM dispatches d
+          WHERE d.invoice_id = i.id
+        ) AS dispatched
+      FROM invoices i
+      JOIN orders o ON o.id = i.order_id
+      JOIN customers c ON c.id = o.customer_id
+      LEFT JOIN payments p ON p.invoice_id = i.id
+      GROUP BY i.id, c.name, o.status
+      ORDER BY i.id DESC
+    `);
 
-  res.json(result.rows);
-}));
+    res.json(result.rows);
+  })
+);
 
 app.post('/purchases',auth('ADMIN','PRODUCTION'),route(async(req,res)=>{const data=z.object({reference:text,itemId:id,quantity:qty,unitCost:qty}).parse(req.body);const result=await tx(async c=>{const old=await query(c,'SELECT * FROM purchases WHERE reference=$1',[data.reference]);if(old.rowCount)return {id:old.rows[0].id,replayed:true};const item=await query(c,'SELECT kind FROM items WHERE id=$1',[data.itemId]);if(!item.rowCount||item.rows[0].kind==='FINISHED')throw fail(400,'Purchase requires raw or packaging item');const r=await query(c,'INSERT INTO purchases(reference,item_id,qty,unit_cost) VALUES($1,$2,$3,$4) RETURNING id',[data.reference,data.itemId,data.quantity,data.unitCost]);const purchaseId=r.rows[0].id;await query(c,'INSERT INTO stock_movements(item_id,delta,source_type,source_id,line_key,unit_cost) VALUES($1,$2,$3,$4,$5,$6)',[data.itemId,data.quantity,'PURCHASE',purchaseId,'item',data.unitCost]);await audit(c,req.user.id,'PURCHASE',purchaseId,'POSTED');return {id:purchaseId,replayed:false};});res.status(result.replayed?200:201).json(result);}));
 app.post('/production-runs',auth('PRODUCTION','ADMIN'),route(async(req,res)=>{const data=z.object({requestKey:uuid,bomId:id,goodOutput:qty,issues:z.array(z.object({itemId:id,quantity:qty,damagedQty:z.optional(z.union([z.string(),z.number()]))})).min(1),labour:z.union([z.string(),z.number()]),energy:z.union([z.string(),z.number()])}).parse(req.body);if(D(data.labour).lt(0)||D(data.energy).lt(0))throw fail(400,'Overhead cannot be negative');const result=await tx(async c=>{const old=await query(c,'SELECT * FROM production_runs WHERE request_key=$1',[data.requestKey]);if(old.rowCount)return {run:old.rows[0],replayed:true};const bom=await query(c,'SELECT * FROM bom WHERE id=$1',[data.bomId]);if(!bom.rowCount)throw fail(404,'BOM not found');const lines=(await query(c,'SELECT * FROM bom_lines WHERE bom_id=$1',[data.bomId])).rows;const issueMap=new Map(data.issues.map(i=>[i.itemId,String(i.quantity)]));if(issueMap.size!==data.issues.length||lines.length!==data.issues.length||lines.some(l=>!issueMap.has(Number(l.item_id))))throw fail(400,'Issues must include each BOM line exactly once');let cost=D(0);const calculated=[];for(const l of lines){const issue=data.issues.find(x=>x.itemId===Number(l.item_id));const issued=D(issue.quantity);const damaged=D(issue.damagedQty??0);if(damaged.lt(0)||damaged.gt(issued))throw fail(400,'Invalid damaged quantity');const stock=await balance(c,l.item_id);if(stock.lt(issued))throw fail(409,`Insufficient stock for item ${l.item_id}`);const valuation=await query(c,`SELECT COALESCE(SUM(CASE WHEN source_type IN ('OPENING','PURCHASE') THEN delta*unit_cost ELSE 0 END),0)::text v, COALESCE(SUM(CASE WHEN source_type IN ('OPENING','PURCHASE') THEN delta ELSE 0 END),0)::text q FROM stock_movements WHERE item_id=$1`,[l.item_id]);const {v,q}=valuation.rows[0];const rate=D(q).isZero()?D(0):D(v).div(q);cost=cost.plus(issued.mul(rate));calculated.push({line:l,issued,damaged});}
@@ -84,6 +133,27 @@ app.post('/orders/:id/invoice',auth('ADMIN'),route(async(req,res)=>{const result
 app.post('/invoices/:id/dispatch',auth('ADMIN'),route(async(req,res)=>{const result=await tx(async c=>{const r=await query(c,'SELECT i.id invoice_id,o.* FROM invoices i JOIN orders o ON o.id=i.order_id WHERE i.id=$1 FOR UPDATE OF o',[req.params.id]);if(!r.rowCount)throw fail(404,'Invoice not found');const o=r.rows[0];const old=await query(c,'SELECT * FROM dispatches WHERE invoice_id=$1',[o.invoice_id]);if(old.rowCount)return old.rows[0];if(o.status!=='INVOICED')throw fail(409,'Invoice not ready to dispatch');const d=await query(c,'INSERT INTO dispatches(invoice_id) VALUES($1) RETURNING *',[o.invoice_id]);await debit(c,o.item_id,o.qty,'DISPATCH',d.rows[0].id,'item',req.user.id);await query(c,"UPDATE orders SET status='DISPATCHED' WHERE id=$1",[o.id]);await audit(c,req.user.id,'DISPATCH',d.rows[0].id,'POSTED');return d.rows[0];});res.json(result);}));
 app.post('/invoices/:id/payments',auth('ADMIN'),route(async(req,res)=>{const d=z.object({reference:text,amount:qty}).parse(req.body);const result=await tx(async c=>{const old=await query(c,'SELECT * FROM payments WHERE reference=$1',[d.reference]);if(old.rowCount)return old.rows[0];const inv=await query(c,'SELECT * FROM invoices WHERE id=$1',[req.params.id]);if(!inv.rowCount)throw fail(404,'Invoice not found');const paid=await query(c,'SELECT COALESCE(SUM(amount),0)::text n FROM payments WHERE invoice_id=$1',[req.params.id]);if(D(paid.rows[0].n).plus(d.amount).gt(inv.rows[0].total))throw fail(409,'Payment exceeds outstanding');const r=await query(c,'INSERT INTO payments(invoice_id,reference,amount) VALUES($1,$2,$3) RETURNING *',[req.params.id,d.reference,d.amount]);await audit(c,req.user.id,'PAYMENT',r.rows[0].id,'RECEIVED');return r.rows[0];});res.status(201).json(result);}));
 app.get('/reports/receivables',auth('ADMIN','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT i.id,i.invoice_no,i.total,COALESCE(SUM(p.amount),0)::numeric(18,2) paid,(i.total-COALESCE(SUM(p.amount),0))::numeric(18,2) outstanding FROM invoices i LEFT JOIN payments p ON p.invoice_id=i.id GROUP BY i.id ORDER BY i.id')).rows)));
-app.get('/reports/production',auth('ADMIN','PRODUCTION','AUDITOR','OWNER'),route(async(req,res)=>res.json((await db.query('SELECT r.*,p.item_id,p.qty,p.planned_qty,p.damaged_qty,p.variance_pct FROM production_runs r JOIN production_issues p ON p.run_id=r.id ORDER BY r.id,p.item_id')).rows)));
+app.get(
+  '/reports/production',
+  auth('ADMIN', 'PRODUCTION', 'AUDITOR', 'OWNER'),
+  route(async (req, res) => {
+    const result = await db.query(`
+      SELECT
+        r.*,
+        p.item_id,
+        i.sku AS material_sku,
+        p.qty,
+        p.planned_qty,
+        p.damaged_qty,
+        p.variance_pct
+      FROM production_runs r
+      JOIN production_issues p ON p.run_id = r.id
+      JOIN items i ON i.id = p.item_id
+      ORDER BY r.id, p.item_id
+    `);
+
+    res.json(result.rows);
+  })
+);
 app.use((err,req,res,next)=>{const status=err instanceof z.ZodError?400:(err.status||((err.code==='23505'||err.code==='23503')?409:500));if(status===500)console.error('Request failed',err);res.status(status).json({error:status===500?'Internal server error':err instanceof z.ZodError?'Invalid input':err.message});});
 const port=Number(process.env.PORT||3000);app.listen(port,()=>console.log(`API listening on ${port}`));
